@@ -18,10 +18,10 @@ Existing device state remains compatible. Tokens already consumed before this Se
 
 ## Docker deployment
 
-Deploy the latest official image (`latest`):
+Deploy the image built by this repository (`latest`):
 
 ```text
-ghcr.io/liguobao/ds-harness-remote/server:latest
+ghcr.io/moderras/ds-harness-remote/server:latest
 ```
 
 ```bash
@@ -41,7 +41,7 @@ docker compose pull server
 docker compose up -d --no-build server
 ```
 
-`latest` tracks the most recent image published by the Tag workflow, rather than the main branch. To build from the current source instead, run `docker compose up -d --build server`.
+`latest` is published by `.github/workflows/server-image.yml` for server-related commits on `main`, along with a `sha-<commit>` tag. To build from the current source instead, run `docker compose up -d --build server`.
 
 If an older image fails to resolve `@dsh-remote/protocol`, update the source and rebuild with `docker compose build --no-cache server && docker compose up -d server`. The image explicitly includes the compiled protocol package and checks the Server import graph during the build. Rebuilding preserves the data volume.
 

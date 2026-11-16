@@ -18,10 +18,10 @@
 
 ## Docker 部署
 
-使用官方最新版镜像（`latest`）：
+使用本仓库构建的镜像（`latest`）：
 
 ```text
-ghcr.io/liguobao/ds-harness-remote/server:latest
+ghcr.io/moderras/ds-harness-remote/server:latest
 ```
 
 ```bash
@@ -41,7 +41,7 @@ docker compose pull server
 docker compose up -d --no-build server
 ```
 
-`latest` 指向最近一次 Tag 工作流发布的镜像，不跟随 main 分支。若要从当前源码自行构建，执行 `docker compose up -d --build server`。
+`latest` 由 `.github/workflows/server-image.yml` 在 `main` 上的服务端相关提交发布，同时打 `sha-<commit>` 标签。若要从当前源码自行构建，执行 `docker compose up -d --build server`。
 
 若旧镜像启动时无法解析 `@dsh-remote/protocol`，更新源码后执行 `docker compose build --no-cache server && docker compose up -d server`。镜像显式包含 protocol 编译产物，并在构建阶段校验 Server 的模块加载；重建会保留数据卷。
 
