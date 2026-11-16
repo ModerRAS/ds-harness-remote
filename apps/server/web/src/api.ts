@@ -19,7 +19,13 @@ export async function api<T>(path: string, body?: unknown): Promise<T> {
   } catch { throw new RequestError('连接失败，请重试。', 0) }
   const data = await response.json()
   if (!response.ok) {
-    const messages: Record<string, string> = { AUTH_INVALID: '账号或密码错误，请重试。', ACCOUNT_AUTH_REQUIRED: '登录已过期，请重新登录。', RATE_LIMITED: '请求频繁，请稍后重试。' }
+    const messages: Record<string, string> = {
+      AUTH_INVALID: '账号或密码错误，请重试。',
+      ACCOUNT_AUTH_REQUIRED: '登录已过期，请重新登录。',
+      ACCOUNT_EXISTS: '这个账号已经注册。',
+      RATE_LIMITED: '请求频繁，请稍后重试。',
+      INVALID_MESSAGE: '提交的内容不符合要求。',
+    }
     throw new RequestError(messages[data.error?.code] ?? '请求失败，请稍后重试。', response.status)
   }
   return data as T

@@ -2,13 +2,13 @@
 
 [English](README.md) · **中文**
 
-单账号 Remote Server，支持 WebRTC（LAN / P2P / TURN）与端到端加密 Relay，环境变量配置账号密码，Web 提供首页、登录和设备状态页。Server 不包含在 Host 插件 bundle 中，需要单独部署。
+多账号 Remote Server，支持 WebRTC（LAN / P2P / TURN）与端到端加密 Relay。环境变量提供种子账号；其他账号在设置注册码后自助注册。每个账号的设备、凭据、Web 会话和中继连接互相隔离。Web 提供首页、登录、注册和设备状态页。Server 不包含在 Host 插件 bundle 中，需要单独部署。
 
 当前版本定位为继续维护的最小自部署 Server。完整 Server Web 的产品形态仍在调整，暂不承诺在本仓库开源当前或未来的完整站点。
 
 ## 自部署页面
 
-首页地址是 `/`，点击“开始使用”进入登录页；登录成功后进入 `/app/remote` 设备列表。Host 和客户端都填写同一个 Server 地址，并使用相同的账号密码登录。设备凭据由 Server 保存，Web 登录会话使用 HttpOnly Cookie。
+首页地址是 `/`，点击“开始使用”进入登录页；登录成功后进入 `/app/remote` 设备列表。Host 和客户端填写同一个 Server 地址，并登录同一个账号。设备凭据由 Server 保存，Web 登录会话使用 HttpOnly Cookie，且只属于该账号。未设置 `DSH_SERVER_REGISTRATION_CODE` 时注册关闭；设置后登录页出现注册入口。
 
 ## 刷新响应丢失恢复
 
@@ -79,12 +79,13 @@ cd apps/server
 node --env-file=.env dist/main.js
 ```
 
-打开 <http://localhost:8080>。Host 和客户端填写同一 Server 地址，使用同一账号密码登录。建议账号使用邮箱格式，以兼容现有客户端。
+打开 <http://localhost:8080>。Host 和客户端填写同一 Server 地址，并登录同一个账号。建议账号使用邮箱格式，以兼容现有客户端。账号名不区分大小写。
 
 | 环境变量 | 用途 / 默认值 |
 | --- | --- |
-| `DSH_SERVER_ACCOUNT` | 必填，登录账号 |
-| `DSH_SERVER_PASSWORD` | 必填，至少 12 字符 |
+| `DSH_SERVER_ACCOUNT` | 必填，种子账号。启动时创建或更新该账号；改名不会删除已有账号 |
+| `DSH_SERVER_PASSWORD` | 必填，至少 12 字符。变更后只让该种子账号的设备重新授权 |
+| `DSH_SERVER_REGISTRATION_CODE` | 可选，至少 12 字符。留空则关闭注册 |
 | `DSH_SERVER_PUBLIC_URL` | 浏览器访问地址，默认 `http://localhost:8080` |
 | `DSH_SERVER_HOST` | 监听/端口映射地址，默认 `127.0.0.1`；局域网设为 `0.0.0.0` |
 | `DSH_SERVER_PORT` | 默认 `8080` |
@@ -130,8 +131,8 @@ DSH_SERVER_TRUSTED_PROXY_IPS=172.18.0.2,2001:db8::2
 
 ## 功能
 
-- 支持设备注册、凭据刷新、设备发现、Control、WebRTC LAN/P2P/TURN 协调与端到端加密 Relay。
-- 单进程运行；持久化保存 `data` 目录。重启后设备凭据保留，Web 需重新登录；修改密码后设备需重新授权。
+- 多账号设备注册、凭据刷新、设备发现、Control、WebRTC LAN/P2P/TURN 协调与端到端加密 Relay。账号之间看不到对方设备，也不能向对方的 Host 发起连接。
+- 单进程运行；持久化保存 `data` 目录。旧的单账号 `state.json`（version 1）会升级为该账号的数据，设备不用重新配对。重启后设备凭据保留，Web 需重新登录；修改某个账号的密码只让该账号的设备重新授权。
 
 验证：`pnpm --filter @dsh-remote/server test`。真实跨机与长期连接仍待回归。UI 复用来源见 [web/UPSTREAM.md](web/UPSTREAM.md)。
 
@@ -141,9 +142,9 @@ DSH_SERVER_TRUSTED_PROXY_IPS=172.18.0.2,2001:db8::2
 
 暂不考虑。Server Web 的产品形态我还在调整，后续会按实际思路继续演进；当前仓库只承诺维护上面介绍的最小自部署版本。
 
-### 为什么没有多账号、完整 membership 和 Remote Web？
+### 多账号怎么开，Remote Web 呢？
 
-这些能力本身实现门槛不高，但不同用户会有不同的场景和取舍，建议按自己的需求修改。Remote Web 稳定后，未来也可能加入当前 Server；目前没有固定时间表。
+种子账号来自 `DSH_SERVER_ACCOUNT` / `DSH_SERVER_PASSWORD`。其他用户在配置了 `DSH_SERVER_REGISTRATION_CODE` 后，用登录页或 `POST /api/v1/auth/register` 注册。每个账号最多 256 台设备；跨账号查询返回 404，跨账号连接表现为 Host 不在线，且不会把信令送到另一个账号。没有管理员上帝视角。完整 Remote Web 会话界面仍不在这个自部署 Server 里。
 
 ## 发布 Tag 检查
 

@@ -2,13 +2,13 @@
 
 **English** · [中文](README.zh.md)
 
-A single-account Remote Server with WebRTC (LAN / P2P / TURN) and end-to-end encrypted Relay, configured through environment variables. Its Web UI includes a landing page, sign-in, and device status page. The Server is deployed separately from the Host plugin bundle.
+A multi-account Remote Server with WebRTC (LAN / P2P / TURN) and end-to-end encrypted Relay. Environment variables provide a seed account; further accounts register themselves when an invite code is set. Devices, credentials, web sessions, and relay links are isolated per account. Its Web UI includes a landing page, sign-in, registration, and a device status page. The Server is deployed separately from the Host plugin bundle.
 
 This remains a small self-hosted Server that we intend to maintain. The product shape of the full Server Web is still evolving, so this repository does not promise to open source the current or future full site.
 
 ## Self-hosted Web flow
 
-The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`. Point both Host and Client at the same Server URL and use the same account and password. Device credentials are persisted by the Server, while Web sessions use an HttpOnly cookie.
+The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`. Point both Host and Client at the same Server URL and sign in to the same account. Device credentials are persisted by the Server, while each Web session is an HttpOnly cookie bound to that account. Registration stays closed until `DSH_SERVER_REGISTRATION_CODE` is set; the login page then offers a register form.
 
 ## Refresh response recovery
 
@@ -79,12 +79,13 @@ cd apps/server
 node --env-file=.env dist/main.js
 ```
 
-Open <http://localhost:8080>. Set the same Server URL on your Host and Client, then sign in with the same account. Use an email address as the account name for compatibility with existing clients.
+Open <http://localhost:8080>. Set the same Server URL on your Host and Client, then sign in to the same account. Use an email address as the account name for compatibility with existing clients. Account names are case-insensitive.
 
 | Variable | Purpose / default |
 | --- | --- |
-| `DSH_SERVER_ACCOUNT` | Required login account |
-| `DSH_SERVER_PASSWORD` | Required; at least 12 characters |
+| `DSH_SERVER_ACCOUNT` | Required seed account. Created or updated on startup; renaming it does not delete existing accounts |
+| `DSH_SERVER_PASSWORD` | Required; at least 12 characters. Changing it reauthorizes only that seed account's devices |
+| `DSH_SERVER_REGISTRATION_CODE` | Optional; at least 12 characters. Empty keeps registration closed |
 | `DSH_SERVER_PUBLIC_URL` | Browser-facing URL; default `http://localhost:8080` |
 | `DSH_SERVER_HOST` | Listen / port-binding address; default `127.0.0.1`, use `0.0.0.0` for LAN access |
 | `DSH_SERVER_PORT` | Default `8080` |
@@ -130,8 +131,8 @@ Apply the change with `docker compose up -d --force-recreate server`; `docker co
 
 ## Features
 
-- Device registration, credential refresh, device discovery, Control, WebRTC LAN/P2P/TURN coordination, and end-to-end encrypted Relay.
-- Single-process operation with persistent data. Device credentials survive restarts; Web users sign in again. Changing the password requires devices to reauthorize.
+- Multi-account device registration, credential refresh, device discovery, Control, WebRTC LAN/P2P/TURN coordination, and end-to-end encrypted Relay. One account cannot see another account's devices or signal its Hosts.
+- Single-process operation with persistent data. A version-1 single-account `state.json` upgrades in place and keeps its devices. Device credentials survive restarts; Web users sign in again. Changing one account's password reauthorizes only that account's devices.
 
 Tests: `pnpm --filter @dsh-remote/server test`. Cross-machine and long-running validation remain pending. UI sources: [web/UPSTREAM.md](web/UPSTREAM.md).
 
@@ -141,9 +142,9 @@ Tests: `pnpm --filter @dsh-remote/server test`. Cross-machine and long-running v
 
 Not for now. The product shape of Server Web is still being worked out and will continue to evolve with that direction. This repository only promises to maintain the small self-hosted version described above.
 
-### Why are multi-account support, full membership, and Remote Web not included?
+### How do extra accounts sign up, and what about Remote Web?
 
-These capabilities are not especially difficult to build, but users have different scenarios and trade-offs, so it is reasonable to adapt them to your own needs. Remote Web may be added to this Server after it becomes stable; there is no fixed schedule.
+The seed account comes from `DSH_SERVER_ACCOUNT` / `DSH_SERVER_PASSWORD`. After `DSH_SERVER_REGISTRATION_CODE` is set, other people register from the login page or `POST /api/v1/auth/register`. Each account can hold 256 devices. A cross-account lookup returns 404, and a cross-account connect looks like an offline Host without delivering signaling. There is no administrator view of other accounts. The full Remote Web session UI is still not part of this self-hosted Server.
 
 ## Release Tag checks
 

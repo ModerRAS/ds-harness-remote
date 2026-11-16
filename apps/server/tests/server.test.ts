@@ -1,9 +1,9 @@
 import { runScenarios, scenarioName } from '../../../scripts/test-scenarios.mjs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomUUID, createHmac } from 'node:crypto'
+import { randomUUID, createHmac, randomBytes, scryptSync } from 'node:crypto'
 import { once } from 'node:events'
 import { createConnection } from 'node:net'
 import { request as httpRequest } from 'node:http'
@@ -33,7 +33,7 @@ import {
   parseLogLevel,
   type LogEntry,
 } from '../src/logger.js'
-import { MAX_ICE_CANDIDATES_PER_CONNECTION } from '../src/gateway.js'
+import { MAX_ICE_CANDIDATES_PER_CONNECTION, peerKey } from '../src/gateway.js'
 import { parseIceConfig } from '../src/ice.js'
 
 const account = 'owner@example.com', password = 'local-test-password'
@@ -1011,7 +1011,7 @@ describe('gateway handshake state machine', () => {
     const [closeCode] = await closed
     expect(closeCode).toBe(4001)
     expect(wire.messages.filter(message => message.type === 'hello.ack')).toHaveLength(0)
-    expect(app.gateway.peers.has(d.deviceId)).toBe(false)
+    expect([...app.gateway.peers.values()].some(peer => peer.id === d.deviceId)).toBe(false)
     expect(app.store.get(d.deviceId).lastSeenAt).toBe(0)
   }, 15000)
 
@@ -1028,7 +1028,7 @@ describe('gateway handshake state machine', () => {
     const live = await socket(d)
     expect((await live.next('hello.ack')).protocol).toBe(1)
     await closed
-    expect(app.gateway.peers.get(d.deviceId)).toBeDefined()
+    expect([...app.gateway.peers.values()].some(peer => peer.id === d.deviceId)).toBe(true)
     live.send('ping', { nonce: 'still-authenticated' })
     expect(await live.next('pong')).toEqual({ nonce: 'still-authenticated' })
   }, 15000)
@@ -1281,15 +1281,13 @@ describe('stale link frame dropping and configurable rate limit', () => {
     await churnHostWire.next('hello.ack')
     await churnClientWire.next('hello.ack')
     const gatewayInternals = app.gateway as unknown as {
-      recordDroppedLink(link: { id: string; host: string; client: string }): void
+      recordDroppedLink(link: { id: string; accountKey: string; host: string; client: string; hostKey: string; clientKey: string }): void
     }
-    for (let i = 0; i < 1100; i++) {
-      gatewayInternals.recordDroppedLink({
-        id: `churn-link-${i}`,
-        host: churnHost.deviceId,
-        client: churnClient.deviceId,
-      })
-    }
+    const dropped = (id: string, hostId: string, clientId: string) => gatewayInternals.recordDroppedLink({
+      id, accountKey: app.store.seedKey, host: hostId, client: clientId,
+      hostKey: peerKey(app.store.seedKey, hostId), clientKey: peerKey(app.store.seedKey, clientId),
+    })
+    for (let i = 0; i < 1100; i++) dropped(`churn-link-${i}`, churnHost.deviceId, churnClient.deviceId)
 
     // Fill the normal 64-frame quota first with active traffic in the current window.
     for (let i = 0; i < 60; i++) {
@@ -1319,13 +1317,7 @@ describe('stale link frame dropping and configurable rate limit', () => {
 
     // Even if the same Host subsequently drops >64 links (evicting ctx.connectionId's tombstone),
     // evictedTombstoneUntil on the Peer still protects late frames for ctx.connectionId.
-    for (let i = 0; i < 70; i++) {
-      gatewayInternals.recordDroppedLink({
-        id: `same-host-churn-${i}`,
-        host: ctx.h.deviceId,
-        client: ctx.c.deviceId,
-      })
-    }
+    for (let i = 0; i < 70; i++) dropped(`same-host-churn-${i}`, ctx.h.deviceId, ctx.c.deviceId)
     expect(app.gateway.droppedLinkFrameCount(ctx.connectionId)).toBe(0)
     for (let i = 0; i < 100; i++) {
       ctx.host.send('relay', {
@@ -1377,7 +1369,7 @@ describe('stale link frame dropping and configurable rate limit', () => {
 
     // Simulate a Host whose last pong is older than heartbeatDisconnectMs before
     // the next periodic interval tick runs.
-    const hostPeer = app.gateway.peers.get(h.deviceId)!
+    const hostPeer = [...app.gateway.peers.values()].find(peer => peer.id === h.deviceId)!
     hostPeer.lastPong = Date.now() - (app.gateway.heartbeatDisconnectMs + 1000)
 
     clientWire.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
@@ -1385,7 +1377,7 @@ describe('stale link frame dropping and configurable rate limit', () => {
       code: 'HOST_OFFLINE',
       retryable: true,
     })
-    expect(app.gateway.peers.has(h.deviceId)).toBe(false)
+    expect([...app.gateway.peers.values()].some(peer => peer.id === h.deviceId)).toBe(false)
 
     // Active frames exceeding the configured 64 frames/sec threshold trigger RATE_LIMITED (4001).
     const noisyClosed = once(noisyWire.ws, 'close')
@@ -1398,5 +1390,99 @@ describe('stale link frame dropping and configurable rate limit', () => {
     })
     const [closeCode] = await noisyClosed
     expect(closeCode).toBe(4001)
+  })
+})
+
+describe('account isolation', () => {
+  it('keeps registration closed until an invite code is configured', async () => {
+    expect((await request('/auth/registration', 'GET')).data).toEqual({ enabled: false })
+    const blocked = await request('/auth/register', 'POST', { email: 'other@example.com', password: '123456789012', code: 'not-a-real-code' })
+    expect(blocked.status).toBe(404)
+    expect(blocked.data.error.code).toBe('METHOD_NOT_FOUND')
+  })
+
+  it('upgrades a v1 state file into the seed account', async () => {
+    await app.close()
+    const keys = generateKeyPair()
+    const deviceId = randomUUID()
+    const salt = randomBytes(32).toString('base64url')
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1, account, salt, verifier: scryptSync(password, salt, 32).toString('hex'),
+      devices: {
+        [deviceId]: {
+          descriptor: { deviceId, name: 'kept', identityKey: keys.publicKey, role: 'host', platform: 'linux', clientVersion: '0.6.5' },
+          revoked: false, lastSeenAt: 0,
+        },
+      },
+      tokens: {},
+    }))
+    await start()
+    const login = await request('/auth/login', 'POST', { email: account.toUpperCase(), password })
+    expect(login.status).toBe(200)
+    expect(login.data.account).toBe(account)
+    const devices = await request('/account/devices', 'GET', undefined, login.data.token)
+    expect(devices.status).toBe(200)
+    expect(devices.data.items.map((item: { deviceId: string }) => item.deviceId)).toEqual([deviceId])
+  })
+
+  it('hides devices, presence and relay links across accounts', async () => {
+    const code = 'invite-code-ok'
+    await app.close()
+    await start(password, [], { registrationCode: code })
+    expect((await request('/auth/registration', 'GET')).data.enabled).toBe(true)
+    const created = await request('/auth/register', 'POST', { email: 'Second@Example.com', password: 'second-password', code })
+    expect(created.status).toBe(200)
+    expect(created.data.account).toBe('Second@Example.com')
+    const again = await request('/auth/register', 'POST', { email: 'second@example.com', password: 'second-password', code })
+    expect(again.status).toBe(409)
+    const wrong = await request('/auth/register', 'POST', { email: 'third@example.com', password: 'third-password-ok', code: 'wrong-code-value' })
+    expect(wrong.status).toBe(401)
+    const secondToken = created.data.token as string
+    const seedLogin = await request('/auth/login', 'POST', { email: account, password })
+    accountToken = seedLogin.data.token
+
+    const sharedId = randomUUID()
+    const keysA = generateKeyPair()
+    const keysB = generateKeyPair()
+    const hostBody = (identityKey: string, name: string) => ({ v: 1, device: { deviceId: sharedId, identityKey, name, role: 'host', platform: 'linux', clientVersion: '0.4.15' } })
+    const regA = await request('/devices/register', 'POST', hostBody(keysA.publicKey, 'host-a'), accountToken)
+    const regB = await request('/devices/register', 'POST', hostBody(keysB.publicKey, 'host-b'), secondToken)
+    expect(regA.status).toBe(200)
+    expect(regB.status).toBe(200)
+    const listA = await request('/account/devices', 'GET', undefined, accountToken)
+    const listB = await request('/account/devices', 'GET', undefined, secondToken)
+    expect(listA.data.items.map((item: { name: string }) => item.name)).toEqual(['host-a'])
+    expect(listB.data.items.map((item: { name: string }) => item.name)).toEqual(['host-b'])
+    expect(listA.data.items[0].membershipId).not.toBe(listB.data.items[0].membershipId)
+
+    const clientA = await device('client')
+    const clientBId = randomUUID()
+    const keysClientB = generateKeyPair()
+    const regClientB = await request('/devices/register', 'POST', { v: 1, device: { deviceId: clientBId, identityKey: keysClientB.publicKey, name: 'client-b', role: 'client', platform: 'linux', clientVersion: '0.4.15' } }, secondToken)
+    expect(regClientB.status).toBe(200)
+    expect((await request(`/devices/${sharedId}`, 'GET', undefined, clientA.accessToken)).data.identityKey).toBe(keysA.publicKey)
+    expect((await request(`/devices/${sharedId}`, 'GET', undefined, regClientB.data.accessToken)).data.identityKey).toBe(keysB.publicKey)
+    expect((await request(`/devices/${sharedId}/name`, 'POST', { name: 'renamed-b' }, secondToken)).status).toBe(200)
+    expect((await request('/account/devices', 'GET', undefined, accountToken)).data.items[0].name).toBe('host-a')
+
+    const hostWire = await socket({ ...regA.data, role: 'host' as const, deviceId: sharedId, clientVersion: '0.4.15', keys: keysA, name: 'host-a', platform: 'linux', identityKey: keysA.publicKey })
+    await hostWire.next('hello.ack')
+    const otherWire = await socket({ ...regClientB.data, role: 'client' as const, deviceId: clientBId, clientVersion: '0.4.15', keys: keysClientB, name: 'client-b', platform: 'linux', identityKey: keysClientB.publicKey })
+    await otherWire.next('hello.ack')
+    otherWire.send('connect.request', { hostDeviceId: sharedId, preferredTransports: ['relay'] })
+    expect(await otherWire.next('error')).toMatchObject({ code: 'HOST_OFFLINE', retryable: true })
+    expect(hostWire.messages.filter(message => message.type === 'connect.incoming')).toHaveLength(0)
+    expect([...app.gateway.peers.values()].filter(peer => peer.id === sharedId)).toHaveLength(1)
+
+    const seedDevice = regA.data.accessToken as string
+    await app.close()
+    await start('a-different-password', [], { registrationCode: code })
+    expect((await request('/devices', 'GET', undefined, seedDevice)).status).toBe(401)
+    expect((await request('/devices', 'GET', undefined, regClientB.data.accessToken)).status).toBe(200)
+    const oldSeed = await request('/auth/login', 'POST', { email: account, password })
+    expect(oldSeed.status).toBe(401)
+    const renamed = await request('/auth/login', 'POST', { email: 'second@example.com', password: 'second-password' })
+    expect(renamed.status).toBe(200)
+    expect((await request('/account/devices', 'GET', undefined, renamed.data.token)).data.items.map((item: { name: string }) => item.name).sort()).toEqual(['client-b', 'renamed-b'])
   })
 })

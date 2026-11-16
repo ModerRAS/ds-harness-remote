@@ -35,9 +35,18 @@ export interface GatewayOptions extends GatewayTimingOptions {
  */
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
-type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string; evictedTombstoneUntil?: number }
-type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
-type DroppedLink = { host: string; client: string; expiresAt: number; droppedFrames: number }
+type Peer = { key: string; accountKey: string; ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string; evictedTombstoneUntil?: number }
+type Link = { id: string; accountKey: string; host: string; client: string; hostKey: string; clientKey: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
+type DroppedLink = { accountKey: string; host: string; client: string; hostKey: string; clientKey: string; expiresAt: number; droppedFrames: number }
+
+/** One account must not replace or address another account's socket, even when device ids collide. */
+export function peerKey(accountKey: string, deviceId: string): string {
+  return `${accountKey}\u0000${deviceId}`
+}
+const MAX_SOCKETS = 4096
+const MAX_PEERS_PER_ACCOUNT = 256
+const MAX_LINKS_PER_ACCOUNT = 256
+const MAX_LINKS = 4096
 
 /** Keep tombstones long enough for late in-flight frames to drain without CONNECTION_NOT_FOUND storms. */
 const DROPPED_LINK_TTL_MS = 300_000
@@ -133,14 +142,14 @@ export class Gateway {
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
 
-    store.onInvalidate = id => this.disconnect(id, 'AUTH_INVALID')
+    store.onInvalidate = (accountKey, deviceId) => this.disconnect(peerKey(accountKey, deviceId), 'AUTH_INVALID')
     server.on('upgrade', (req, socket, head) => {
       const path = requestPath(req.url)
       // The route still requires an exact match: a query string is rejected
       // (exactly as before) but only its parsed pathname is ever logged.
       const pathRejected = req.url !== '/ws/v1/connect'
       const originRejected = Boolean(req.headers.origin) && req.headers.origin !== origin
-      if (pathRejected || originRejected || this.wss.clients.size >= 256) {
+      if (pathRejected || originRejected || this.wss.clients.size >= MAX_SOCKETS) {
         this.logger.warn('ws_upgrade_rejected', {
           // Parsed pathname only: the raw URL may carry credentials in its query.
           path: path === '' ? 'unknown' : path,
@@ -169,7 +178,7 @@ export class Gateway {
             elapsedMs: Date.now() - peer.lastPong,
             thresholdMs: this.heartbeatDisconnectMs,
           })
-          this.disconnect(peer.id, 'CONNECTION_FAILED')
+          this.disconnect(peer.key, 'CONNECTION_FAILED')
           continue
         }
         peer.nonce = randomUUID()
@@ -192,8 +201,8 @@ export class Gateway {
   private evictDroppedLink(id: string, entry: DroppedLink, now: number): void {
     this.droppedLinks.delete(id)
     if (entry.expiresAt <= now) return
-    for (const peerId of [entry.host, entry.client]) {
-      const p = this.peers.get(peerId)
+    for (const key of [entry.hostKey, entry.clientKey]) {
+      const p = this.peers.get(key)
       if (p) p.evictedTombstoneUntil = Math.max(p.evictedTombstoneUntil ?? 0, entry.expiresAt)
     }
   }
@@ -205,7 +214,7 @@ export class Gateway {
     let hostCount = 0
     let oldestForHost: [string, DroppedLink] | undefined
     for (const [id, entry] of this.droppedLinks) {
-      if (entry.host === link.host) {
+      if (entry.hostKey === link.hostKey) {
         if (oldestForHost === undefined) oldestForHost = [id, entry]
         hostCount += 1
       }
@@ -219,8 +228,11 @@ export class Gateway {
       this.evictDroppedLink(oldest[0], oldest[1], now)
     }
     this.droppedLinks.set(link.id, {
+      accountKey: link.accountKey,
       host: link.host,
       client: link.client,
+      hostKey: link.hostKey,
+      clientKey: link.clientKey,
       expiresAt: now + DROPPED_LINK_TTL_MS,
       droppedFrames: 0,
     })
@@ -240,6 +252,7 @@ export class Gateway {
       this.droppedLinks.delete(id)
       return false
     }
+    if (peer.accountKey !== dropped.accountKey) return false
     if (peer.id !== dropped.host && peer.id !== dropped.client) return false
     dropped.droppedFrames += 1
     if (dropped.droppedFrames === 1) {
@@ -258,23 +271,23 @@ export class Gateway {
 
   private send(peer: Peer, frame: ControlFrame): void {
     if (peer.ws.readyState !== WebSocket.OPEN) return
-    if (peer.ws.bufferedAmount > 4 * MAX_RELAY_FRAME_BYTES) { this.disconnect(peer.id, 'SLOW_CONSUMER'); return }
+    if (peer.ws.bufferedAmount > 4 * MAX_RELAY_FRAME_BYTES) { this.disconnect(peer.key, 'SLOW_CONSUMER'); return }
     peer.ws.send(JSON.stringify(frame))
   }
   private drop(link: Link, code: string): void {
     this.links.delete(link.id)
     this.recordDroppedLink(link)
-    for (const id of [link.host, link.client]) {
-      const p = this.peers.get(id)
+    for (const key of [link.hostKey, link.clientKey]) {
+      const p = this.peers.get(key)
       if (p && (p.role === 'client' || modernHost(p.version))) this.send(p, createControlFrame('error', { code, message: code, connectionId: link.id, retryable: true }))
     }
   }
-  disconnect(id: string, code: string): void {
-    const peer = this.peers.get(id)
-    this.peers.delete(id)
-    for (const link of this.links.values()) if (link.host === id || link.client === id) this.drop(link, code)
+  disconnect(key: string, code: string): void {
+    const peer = this.peers.get(key)
+    this.peers.delete(key)
+    for (const link of this.links.values()) if (link.hostKey === key || link.clientKey === key) this.drop(link, code)
     if (!peer) return
-    this.logger.info('ws_peer_disconnected', { peerId: id, code })
+    this.logger.info('ws_peer_disconnected', { peerId: peer.id, code })
     try {
       peer.ws.close(code === 'CONNECTION_REPLACED' ? 4003 : 4001, code)
     } catch {
@@ -291,12 +304,15 @@ export class Gateway {
    * of an active logical connection may obtain credentials, and only while
    * that connection is still being established.
    */
-  authorizeIce(deviceId: string, connectionId: string): boolean {
+  authorizeIce(accountKey: string, deviceId: string, connectionId: string): boolean {
     const link = this.links.get(connectionId)
-    if (link === undefined) return false
+    if (link === undefined || link.accountKey !== accountKey) return false
     if (link.host !== deviceId && link.client !== deviceId) return false
     if (link.stage !== 'accepted' && link.stage !== 'handshake') return false
-    return this.peers.has(link.host) && this.peers.has(link.client)
+    return this.peers.has(link.hostKey) && this.peers.has(link.clientKey)
+  }
+  private find(accountKey: string, deviceId: string): Peer | undefined {
+    return this.peers.get(peerKey(accountKey, deviceId))
   }
   private supportedCapabilities(): string[] {
     return SUPPORTED_TRANSPORTS.filter(capability => capability !== 'transport.turn' || this.turnEnabled)
@@ -381,7 +397,7 @@ export class Gateway {
         // The close reason is arbitrary client text: report only its presence.
         hasReason: Buffer.isBuffer(reason) ? reason.length > 0 : false,
       })
-      if (peer && this.peers.get(peer.id) === peer) this.disconnect(peer.id, 'CONNECTION_FAILED')
+      if (peer && this.peers.get(peer.key) === peer) this.disconnect(peer.key, 'CONNECTION_FAILED')
     })
     ws.on('message', (raw, binary) => {
       // Frames arriving after the handshake deadline are dropped before any
@@ -415,21 +431,26 @@ export class Gateway {
         if (state === 'awaiting_hello') {
           if (frame.type !== 'hello') throw new ApiError('AUTH_REQUIRED')
           const p = frame.payload as HelloPayload
-          const device = this.store.authenticate(p.accessToken).descriptor
+          const authenticated = this.store.authenticate(p.accessToken)
+          const device = authenticated.descriptor
           if (device.deviceId !== p.deviceId || device.role !== p.role) throw new ApiError('AUTH_INVALID')
           if (!p.protocols.includes(1)) throw new ApiError('UNSUPPORTED_VERSION')
           // Re-assert the state: if the deadline fired while credentials were
           // checked, the timeout wins and none of the side effects below run.
           if (state !== 'awaiting_hello') return
+          const key = peerKey(authenticated.accountKey, device.deviceId)
+          let accountPeers = 0
+          for (const existing of this.peers.values()) if (existing.accountKey === authenticated.accountKey && existing.key !== key) accountPeers += 1
+          if (accountPeers >= MAX_PEERS_PER_ACCOUNT) throw new ApiError('RATE_LIMITED')
           state = 'authenticated'
           clearDeadline()
-          this.disconnect(device.deviceId, 'CONNECTION_REPLACED')
+          this.disconnect(key, 'CONNECTION_REPLACED')
           // Keep the negotiated set (what hello.ack advertises), so a link can
           // never coordinate a transport this Server did not offer — e.g. TURN
           // while no TURN deployment is configured.
-          peer = { ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
-          this.peers.set(peer.id, peer)
-          this.store.touch(peer.id, p.clientVersion, p.harnessVersion)
+          peer = { key, accountKey: authenticated.accountKey, ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
+          this.peers.set(peer.key, peer)
+          this.store.touch(peer.accountKey, peer.id, p.clientVersion, p.harnessVersion)
           this.logger.info('ws_hello_authenticated', {
             deviceId: safeText(peer.id),
             role: peer.role,
@@ -450,8 +471,8 @@ export class Gateway {
           return
         }
         if (frame.type === 'hello') throw new ApiError('INVALID_MESSAGE')
-        if (!peer || this.peers.get(peer.id) !== peer) throw new ApiError('AUTH_INVALID')
-        this.store.get(peer.id)
+        if (!peer || this.peers.get(peer.key) !== peer) throw new ApiError('AUTH_INVALID')
+        this.store.get(peer.id, peer.accountKey)
         if (this.isDroppedLinkFrame(peer, frame)) {
           if (++droppedFrames > maxDroppedFrames || (droppedBytes += frameBytes) > maxDroppedBytes) {
             throw new ApiError('RATE_LIMITED')
@@ -474,7 +495,7 @@ export class Gateway {
         const connectionId = (frame?.payload as { connectionId?: unknown } | undefined)?.connectionId
         if (peer && typeof connectionId === 'string' && code !== 'RATE_LIMITED') {
           const link = this.links.get(connectionId)
-          if (link && (link.host === peer.id || link.client === peer.id)) { this.drop(link, code); return }
+          if (link && link.accountKey === peer.accountKey && (link.host === peer.id || link.client === peer.id)) { this.drop(link, code); return }
           this.send(peer, createControlFrame('error', { code, message: code, connectionId, retryable: false }))
           return
         }
@@ -483,7 +504,7 @@ export class Gateway {
         if (ws.readyState === WebSocket.OPEN) {
           try { ws.send(JSON.stringify(createControlFrame('error', { code, message: code, retryable: false }))) } catch { /* closing anyway */ }
         }
-        if (peer) this.disconnect(peer.id, code)
+        if (peer) this.disconnect(peer.key, code)
         else {
           try { ws.close(4001, code) } catch { /* terminate below */ }
           terminateSoon(ws)
@@ -501,7 +522,7 @@ export class Gateway {
     if (frame.type === 'connect.request') {
       const request = frame.payload as ConnectRequestPayload
       if (peer.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED')
-      const candidateHost = this.peers.get(request.hostDeviceId)
+      const candidateHost = this.find(peer.accountKey, request.hostDeviceId)
       if (candidateHost && Date.now() - candidateHost.lastPong > this.heartbeatDisconnectMs) {
         this.logger.warn('ws_heartbeat_timeout', {
           peerId: candidateHost.id,
@@ -510,11 +531,11 @@ export class Gateway {
           elapsedMs: Date.now() - candidateHost.lastPong,
           thresholdMs: this.heartbeatDisconnectMs,
         })
-        this.disconnect(candidateHost.id, 'CONNECTION_FAILED')
+        this.disconnect(candidateHost.key, 'CONNECTION_FAILED')
       }
-      const host = this.peers.get(request.hostDeviceId)
-      if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
-      this.store.get(host.id)
+      const host = this.find(peer.accountKey, request.hostDeviceId)
+      if (!host || host.role !== 'host' || host.accountKey !== peer.accountKey) { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
+      this.store.get(host.id, host.accountKey)
       if (!request.preferredTransports.includes('relay') || !peer.capabilities.includes('transport.relay') || !host.capabilities.includes('transport.relay')) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
       // The link coordinates only transports both peers actually advertised;
       // the Host receives the same intersection so it never sees a transport
@@ -522,12 +543,17 @@ export class Gateway {
       const preferredTransports = [...new Set(request.preferredTransports)].filter(transport =>
         peer.capabilities.includes(`transport.${transport}`) && host.capabilities.includes(`transport.${transport}`))
       if (preferredTransports.length === 0) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
-      for (const old of this.links.values()) if (old.client === peer.id || (old.host === host.id && !modernHost(host.version))) this.drop(old, 'CONNECTION_REPLACED')
-      if (this.links.size >= 256) throw new ApiError('RATE_LIMITED')
+      for (const old of this.links.values()) if (old.accountKey === peer.accountKey && (old.clientKey === peer.key || (old.hostKey === host.key && !modernHost(host.version)))) this.drop(old, 'CONNECTION_REPLACED')
+      let accountLinks = 0
+      for (const existing of this.links.values()) if (existing.accountKey === peer.accountKey) accountLinks += 1
+      if (accountLinks >= MAX_LINKS_PER_ACCOUNT || this.links.size >= MAX_LINKS) throw new ApiError('RATE_LIMITED')
       const link: Link = {
         id: randomUUID(),
+        accountKey: peer.accountKey,
         host: host.id,
         client: peer.id,
+        hostKey: host.key,
+        clientKey: peer.key,
         stage: 'pending',
         created: Date.now(),
         counters: new Map(),
@@ -538,7 +564,7 @@ export class Gateway {
       this.send(host, createControlFrame('connect.incoming', {
         connectionId: link.id,
         clientDeviceId: peer.id,
-        clientIdentityKey: this.store.get(peer.id).descriptor.identityKey,
+        clientIdentityKey: this.store.get(peer.id, peer.accountKey).descriptor.identityKey,
         authorization: 'account',
         preferredTransports: link.preferredTransports,
       }))
@@ -546,10 +572,11 @@ export class Gateway {
     }
     const id = p.connectionId
     const link = typeof id === 'string' ? this.links.get(id) : undefined
-    if (!link || (peer.id !== link.host && peer.id !== link.client)) throw new ApiError('CONNECTION_NOT_FOUND')
+    if (!link || link.accountKey !== peer.accountKey || (peer.id !== link.host && peer.id !== link.client)) throw new ApiError('CONNECTION_NOT_FOUND')
     const otherId = peer.id === link.host ? link.client : link.host
-    const other = this.peers.get(otherId)
-    this.store.get(otherId)
+    const otherKey = peer.key === link.hostKey ? link.clientKey : link.hostKey
+    const other = this.peers.get(otherKey)
+    this.store.get(otherId, link.accountKey)
     if (!other) throw new ApiError('CONNECTION_FAILED')
     if (frame.type === 'connect.accepted' || frame.type === 'connect.rejected') {
       if (peer.id !== link.host || link.stage !== 'pending') throw new ApiError('INVALID_MESSAGE')

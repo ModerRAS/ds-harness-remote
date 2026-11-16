@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { generateKeyPair } from '../../../packages/crypto/src/index.js'
-import { Store, hash, secret } from '../src/store.js'
+import { Store, accountKey, hash, secret } from '../src/store.js'
 import { runScenarios } from '../../../scripts/test-scenarios.mjs'
 
 const account = 'owner@example.com', password = 'test-only-password'
@@ -54,7 +54,13 @@ it('keeps revoke, registration, account and device boundaries on recoverable tok
         expect(s.authenticate(replacement.accessToken).descriptor.deviceId).toBe(d.deviceId)
       }
       if (kind === 'password') s = new Store(path, account, 'changed-password')
-      if (kind === 'account') s = new Store(path, 'different@example.com', password)
+      if (kind === 'account') {
+        s = new Store(path, 'different@example.com', password)
+        expect(s.refresh(d.deviceId, old.refreshToken)).toEqual(pair)
+        expect(s.authenticate(pair.accessToken).descriptor.deviceId).toBe(d.deviceId)
+        expect(s.list()).toHaveLength(0)
+        return
+      }
       const target = kind === 'other-device' ? other.deviceId : d.deviceId
       const token = kind === 'invalid-token' ? secret() : old.refreshToken
       expect(() => s.refresh(target, token)).toThrow()
@@ -88,7 +94,7 @@ it('does not consume a refresh token on failed persistence or exhausted storage'
   rewrite(state => {
     const count = Object.keys(state.tokens).length
     for (let i = count; i < 16383; i++) state.tokens[hash('filler-' + i)] = {
-      kind: 'access', deviceId: d.deviceId, expires: now + 60_000, used: false,
+      kind: 'access', deviceId: d.deviceId, accountKey: accountKey(account), expires: now + 60_000, used: false,
     }
   })
   expect(() => store.refresh(d.deviceId, pair.refreshToken)).toThrow('RATE_LIMITED')

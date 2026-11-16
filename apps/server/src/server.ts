@@ -7,7 +7,7 @@ import { isIP } from 'node:net'
 import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema, parseWireJson } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
-import { Gateway } from './gateway.js'
+import { Gateway, peerKey } from './gateway.js'
 import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
 import {
@@ -27,6 +27,8 @@ import {
 export interface Config {
   account: string
   password: string
+  /** Invite code for POST /api/v1/auth/register. Omit or leave empty to keep registration closed. */
+  registrationCode?: string
   dataFile: string
   publicUrl: string
   trustedProxyIps?: readonly string[]
@@ -81,6 +83,9 @@ export {
 export type { GatewayTimingOptions, NormalizedGatewayOptions } from './config.js'
 
 const loginSchema = z.object({ email: z.string().min(1).max(254), password: z.string().min(1).max(1024) }).strict()
+const registerSchema = loginSchema.extend({ code: z.string().min(1).max(256) }).strict()
+const MAX_SESSIONS = 4096
+const MAX_SESSIONS_PER_ACCOUNT = 64
 const publicDir = fileURLToPath(new URL('../dist/public/', import.meta.url))
 function readAssets(): Map<string, Buffer> {
   if (!existsSync(publicDir)) return new Map()
@@ -162,13 +167,16 @@ export function clientAddress(req: IncomingMessage, trustedProxyIps: ReadonlySet
 }
 export function createRemoteServer(config: Config) {
   if (!config.account.trim() || config.password.length < 12) throw new Error('DSH_SERVER_ACCOUNT and DSH_SERVER_PASSWORD (at least 12 characters) are required.')
+  const registrationCode = config.registrationCode?.trim() ?? ''
+  if (registrationCode && registrationCode.length < 12) throw new Error('DSH_SERVER_REGISTRATION_CODE must be at least 12 characters when set.')
+  const registrationEnabled = registrationCode.length >= 12
   const url = new URL(config.publicUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('DSH_SERVER_PUBLIC_URL must be an HTTP(S) origin.')
   const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
   const ice = config.ice ?? parseIceConfig({})
   const store = new Store(config.dataFile, config.account.trim(), config.password)
   const assets = readAssets()
-  const sessions = new Map<string, number>()
+  const sessions = new Map<string, { accountKey: string; expires: number }>()
   const limits = new Map<string, { count: number; until: number }>()
   function rate(key: string, max: number) {
     for (const [k, v] of limits) if (v.until < Date.now()) limits.delete(k)
@@ -181,16 +189,31 @@ export function createRemoteServer(config: Config) {
     if (authorization) return authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
     return /(?:^|;\s*)dsh_session=([A-Za-z0-9_-]+)/.exec(req.headers.cookie ?? '')?.[1] ?? ''
   }
-  function accountAuth(req: IncomingMessage) {
+  function accountAuth(req: IncomingMessage): string {
     const key = hash(token(req))
-    if ((sessions.get(key) ?? 0) <= Date.now()) { sessions.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    const session = sessions.get(key)
+    if (!session || session.expires <= Date.now()) { sessions.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    return session.accountKey
+  }
+  function openSession(accountKey: string): { value: string; expiresAt: number } {
+    for (const [key, session] of sessions) if (session.expires <= Date.now()) sessions.delete(key)
+    if (sessions.size >= MAX_SESSIONS) throw new ApiError('RATE_LIMITED', 429)
+    let mine = 0
+    for (const session of sessions.values()) if (session.accountKey === accountKey) mine += 1
+    if (mine >= MAX_SESSIONS_PER_ACCOUNT) throw new ApiError('RATE_LIMITED', 429)
+    const value = secret()
+    const expiresAt = Date.now() + 8 * 3600_000
+    sessions.set(hash(value), { accountKey, expires: expiresAt })
+    return { value, expiresAt }
+  }
+  function publicProfile(account: string) {
+    return { account, profile: { displayName: account }, isAdmin: false as const }
   }
   function deviceAuth(req: IncomingMessage) {
     if (!req.headers.authorization?.startsWith('Bearer ')) throw new ApiError('AUTH_REQUIRED', 401)
     return store.authenticate(req.headers.authorization.slice(7))
   }
   function cookie(value: string, age: number): string { return `dsh_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${url.protocol === 'https:' ? '; Secure' : ''}` }
-  const profile = () => ({ account: store.account, profile: { displayName: store.account }, isAdmin: false })
   const server = createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -219,8 +242,8 @@ export function createRemoteServer(config: Config) {
     logger: logger.child('gateway'),
     turnEnabled: ice.turnUrls.length > 0,
   })
-  function descriptor(d: ReturnType<Store['get']>) {
-    return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
+  function descriptor(accountKey: string, d: ReturnType<Store['get']>) {
+    return { ...d.descriptor, membershipId: store.membershipId(accountKey), online: gateway.peers.has(peerKey(accountKey, d.descriptor.deviceId)), lastSeenAt: d.lastSeenAt }
   }
   async function route(req: IncomingMessage, res: ServerResponse) {
     const requestUrl = new URL(req.url ?? '/', url)
@@ -244,67 +267,84 @@ export function createRemoteServer(config: Config) {
     if (method === 'GET' && (path === '/health' || path === '/healthz' || path === '/ready')) { json(res, 200, { status: 'ok' }); return }
     const client = clientAddress(req, trustedProxyIps)
     rate(`api:${client}`, 240)
+    if (method === 'GET' && path === '/api/v1/auth/registration') {
+      json(res, 200, { enabled: registrationEnabled }); return
+    }
+    if (method === 'POST' && path === '/api/v1/auth/register') {
+      if (!registrationEnabled) throw new ApiError('METHOD_NOT_FOUND', 404)
+      rate(`register:${client}`, 10)
+      const credentials = registerSchema.parse(await body(req))
+      if (!equal(credentials.code, registrationCode)) throw new ApiError('AUTH_INVALID', 401)
+      if (credentials.password.length < 12) throw new ApiError('INVALID_MESSAGE')
+      const user = store.registerAccount(credentials.email, credentials.password)
+      const session = openSession(user.accountKey)
+      res.setHeader('Set-Cookie', cookie(session.value, 8 * 3600))
+      json(res, 200, { ...publicProfile(user.account), token: session.value, expiresAt: session.expiresAt }); return
+    }
     if (method === 'POST' && path === '/api/v1/auth/login') {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
-      if (!equal(credentials.email.trim(), store.account) || !equal(credentials.password, config.password)) throw new ApiError('AUTH_INVALID', 401)
-      for (const [key, expires] of sessions) if (expires <= Date.now()) sessions.delete(key)
-      if (sessions.size >= 256) throw new ApiError('RATE_LIMITED', 429)
-      const value = secret(), expiresAt = Date.now() + 8 * 3600_000
-      sessions.set(hash(value), expiresAt)
-      res.setHeader('Set-Cookie', cookie(value, 8 * 3600))
-      json(res, 200, { ...profile(), token: value, expiresAt }); return
+      const user = store.login(credentials.email, credentials.password)
+      const session = openSession(user.accountKey)
+      res.setHeader('Set-Cookie', cookie(session.value, 8 * 3600))
+      json(res, 200, { ...publicProfile(user.account), token: session.value, expiresAt: session.expiresAt }); return
     }
-    if (method === 'GET' && path === '/api/v1/auth/me') { accountAuth(req); json(res, 200, profile()); return }
+    if (method === 'GET' && path === '/api/v1/auth/me') {
+      json(res, 200, publicProfile(store.displayName(accountAuth(req)))); return
+    }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
       sessions.delete(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
     }
     if (method === 'GET' && path === '/api/v1/account/devices') {
-      accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'webrtc' }); return
+      const accountKey = accountAuth(req)
+      json(res, 200, { items: store.list(accountKey).map(d => descriptor(accountKey, d)), serverUrl: url.origin, transport: 'webrtc' }); return
     }
     if (method === 'POST' && (path === '/api/v1/devices/register' || path === '/api/v1/devices/register-owned-role')) {
       const source = path.endsWith('register-owned-role') ? deviceAuth(req) : undefined
-      if (!source) accountAuth(req)
+      const accountKey = source ? source.accountKey : accountAuth(req)
       const { device } = deviceRegistrationRequestSchema.parse(await body(req))
       if (source && (source.descriptor.deviceId === device.deviceId || source.descriptor.role === device.role)) throw new ApiError('INVALID_MESSAGE', 409)
-      json(res, 200, store.register(device)); return
+      json(res, 200, store.register(device, accountKey)); return
     }
     if (method === 'POST' && path === '/api/v1/auth/refresh') {
       const data = deviceRefreshRequestSchema.parse(await body(req))
       json(res, 200, store.refresh(data.deviceId, data.refreshToken)); return
     }
     if (method === 'DELETE' && path === '/api/v1/devices/self') {
-      store.revoke(deviceAuth(req).descriptor.deviceId); json(res, 200, { status: 'revoked' }); return
+      const current = deviceAuth(req)
+      store.revoke(current.descriptor.deviceId, current.accountKey); json(res, 200, { status: 'revoked' }); return
     }
-    if (method === 'GET' && path === '/api/v1/me') { json(res, 200, descriptor(deviceAuth(req))); return }
+    if (method === 'GET' && path === '/api/v1/me') {
+      const current = deviceAuth(req); json(res, 200, descriptor(current.accountKey, current)); return
+    }
     if (method === 'GET' && path === '/api/v1/turn/credentials') {
       const source = deviceAuth(req)
       const connectionId = requestUrl.searchParams.get('connection_id') ?? ''
       if (!connectionId || connectionId.length > 128) throw new ApiError('INVALID_MESSAGE')
-      if (!gateway.authorizeIce(source.descriptor.deviceId, connectionId)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
+      if (!gateway.authorizeIce(source.accountKey, source.descriptor.deviceId, connectionId)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
       json(res, 200, { iceServers: buildIceServers(ice, source.descriptor.deviceId) }); return
     }
     if (method === 'GET' && path === '/api/v1/devices') {
       const source = deviceAuth(req)
       if (source.descriptor.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-      const items = store.list().filter(d => d.descriptor.role === 'host').map(d => {
-        const { identityKey: _key, ...item } = descriptor(d)
+      const items = store.list(source.accountKey).filter(d => d.descriptor.role === 'host').map(d => {
+        const { identityKey: _key, ...item } = descriptor(source.accountKey, d)
         return item
       })
       json(res, 200, { items, nextCursor: null }); return
     }
     const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
     if (method === 'POST' && renameMatch) {
-      accountAuth(req)
+      const accountKey = accountAuth(req)
       const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(await body(req))
-      store.rename(renameMatch[1]!, name)
-      json(res, 200, descriptor(store.get(renameMatch[1]!))); return
+      store.rename(renameMatch[1]!, name, accountKey)
+      json(res, 200, descriptor(accountKey, store.get(renameMatch[1]!, accountKey))); return
     }
     const match = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
     if (method === 'GET' && match) {
-      const source = deviceAuth(req), target = store.get(match[1]!)
+      const source = deviceAuth(req), target = store.get(match[1]!, source.accountKey)
       if (source.descriptor.role === target.descriptor.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-      const d = descriptor(target)
+      const d = descriptor(source.accountKey, target)
       json(res, 200, match[2] ? { deviceId: d.deviceId, online: d.online, lastSeenAt: d.lastSeenAt } : d); return
     }
     throw new ApiError('METHOD_NOT_FOUND', 404)
