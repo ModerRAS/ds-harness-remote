@@ -31,7 +31,7 @@ import { readClaudeHistory, selectClaudeModel } from '../services/claude'
 import { loadHermesCatalog, mergeHermesCatalog, readHermesHistory, selectHermesModel } from '../services/hermes'
 import { readPiHistory, selectPiModel } from '../services/pi'
 import { saveCodexPermissionPreset } from '../services/storage'
-import { browseKey, browseScope, getCachedSessionMessages, saveSessionMessagesSnapshot, updateBrowseEntry, useBrowseMemory } from '../services/browse-memory'
+import { browseKey, browseScope, getCachedSessionMessages, getFollowResume, saveFollowResume, saveSessionMessagesSnapshot, updateBrowseEntry, useBrowseMemory } from '../services/browse-memory'
 import type { RemoteSession } from '../types'
 import { loadSavedCodexPermissions, withBestCodexPermission, withCodexPermissionState } from './codex-session-state'
 import { foldHistory, settleTurnItems } from './event-reducer'
@@ -410,8 +410,11 @@ export function createSessionActions({ get, set, runtime }: SessionAccess): Pick
         }
         void runtime.closeActiveCodexStream()
         void runtime.closeActiveCursorStream()
+        const resume = preservedMessages !== undefined && preservedMessages.length > 0
+          ? getFollowResume(memoryScope, session.sessionId)
+          : undefined
         const [history, feedback] = await Promise.all([
-          runtime.connection.requireProxy().sessionHistory(session.sessionId, undefined, 16, isSubagentSession(session) ? session.parentSessionId : undefined),
+          runtime.connection.requireProxy().sessionHistory(session.sessionId, undefined, 16, isSubagentSession(session) ? session.parentSessionId : undefined, resume),
           // Older carriers may not expose feedback; history must remain usable.
           runtime.connection.requireProxy().messageFeedbackList(session.sessionId).catch(() => undefined),
         ])
@@ -420,6 +423,17 @@ export function createSessionActions({ get, set, runtime }: SessionAccess): Pick
         // sessionHistory — apply queued frames before reading them below, or the
         // delivery reconcile judges against a stale inbox.
         runtime.flushPendingMuxFrames()
+        if (history.unchanged === true && preservedMessages !== undefined && preservedMessages.length > 0) {
+          const showingDiskCache = inMemoryMessages === undefined || inMemoryMessages.length === 0
+          const oldest = oldestCachedSeq(preservedMessages)
+          set({
+            busyAction: undefined,
+            historyLoadingOlder: false,
+            historyHasMore: history.hasMore === true || (showingDiskCache && resume?.truncated === true),
+            ...(oldest === undefined ? {} : { oldestLoadedSeq: oldest }),
+          })
+          return
+        }
         const ratings = feedback === undefined ? undefined : new Map(feedback.map(row => [row.messageId, row.rating]))
         const items = foldHistory(history.events, session.sessionId, true)
         set(state => {
@@ -468,7 +482,12 @@ export function createSessionActions({ get, set, runtime }: SessionAccess): Pick
             ?? (effectivelyRunning ? [...items].reverse().find(item => item.turn !== undefined && item.turnEnd === undefined)?.turn : undefined)
           const restored = effectivelyRunning === false ? settleTurnItems(withQuestions)
             : activeTurn === undefined ? withQuestions : settleTurnItems(withQuestions, undefined, activeTurn)
-          if (canPersistSnapshot()) saveSessionMessagesSnapshot(memoryScope, session.sessionId, restored)
+          if (canPersistSnapshot()) {
+            const truncated = saveSessionMessagesSnapshot(memoryScope, session.sessionId, restored)
+            if (history.snapshotHash !== undefined && history.throughSeq !== undefined) {
+              saveFollowResume(memoryScope, session.sessionId, history.snapshotHash, history.throughSeq, truncated)
+            }
+          }
           return {
             selectedSession: nextSession,
             sessions: state.sessions.map(item => item.sessionId === session.sessionId ? nextSession : item),
@@ -1139,4 +1158,14 @@ export function createSessionActions({ get, set, runtime }: SessionAccess): Pick
       }
     },
   }
+}
+
+function oldestCachedSeq(items: { nativeOrderSeq?: number; nativeSeq?: number }[]): number | undefined {
+  let oldest: number | undefined
+  for (const item of items) {
+    const seq = item.nativeOrderSeq ?? item.nativeSeq
+    if (typeof seq !== 'number' || !Number.isSafeInteger(seq)) continue
+    oldest = oldest === undefined ? seq : Math.min(oldest, seq)
+  }
+  return oldest
 }

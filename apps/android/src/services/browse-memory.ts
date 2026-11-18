@@ -10,6 +10,7 @@ export type BrowseEntry = {
   seenAt?: number; visitedAt?: number; session?: RemoteSession
   groupRounds?: Record<string, Record<string, string | number | boolean | null>[]>
   messages?: ChatItem[]
+  followResume?: { hash: string; cursor: number; truncated?: boolean }
 }
 type Snapshot = {
   entries: Record<string, BrowseEntry>
@@ -33,9 +34,10 @@ const file = (fs: typeof import('expo-file-system/legacy')) => `${fs.documentDir
 const keyName = 'dshremote.browse-key.v1'
 const aad = 'dsh-remote-private-browse-v1'
 
-export const MAX_CACHED_MESSAGES_PER_SESSION = 30
+export const MAX_CACHED_MESSAGES_PER_SESSION = 800
 export const MAX_CACHED_SESSIONS = 10
 const MAX_TEXT_CHARS = 32768
+const MAX_CACHED_MESSAGE_CHARS = 1_500_000
 
 const capText = (text?: string): string | undefined =>
   text && text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text
@@ -78,11 +80,27 @@ export function isValidCachedChatItem(item: unknown): item is ChatItem {
     ['message', 'tool', 'approval', 'question'].includes(candidate.kind)
 }
 
+function cachedMessageChars(item: ChatItem): number {
+  if (item.kind === 'message') return item.text.length + (item.reasoning?.length ?? 0)
+  if (item.kind === 'tool') return (item.callDetail?.text?.length ?? 0) + (item.resultDetail?.text?.length ?? 0)
+  return 0
+}
+
 export function sanitizeCachedMessages(items?: ChatItem[]): ChatItem[] | undefined {
   if (!items || !Array.isArray(items) || items.length === 0) return undefined
-  const valid = items.filter(isValidCachedChatItem)
+  const valid = items.filter(isValidCachedChatItem).slice(-MAX_CACHED_MESSAGES_PER_SESSION).map(sanitizeCachedMessage)
   if (valid.length === 0) return undefined
-  return valid.slice(-MAX_CACHED_MESSAGES_PER_SESSION).map(sanitizeCachedMessage)
+  let chars = 0
+  let start = valid.length
+  for (let index = valid.length - 1; index >= 0; index -= 1) {
+    const item = valid[index]
+    if (item === undefined) break
+    const next = chars + cachedMessageChars(item)
+    if (next > MAX_CACHED_MESSAGE_CHARS && index < valid.length - 1) break
+    chars = next
+    start = index
+  }
+  return valid.slice(start)
 }
 
 export function enforceSessionMessageLimits(
@@ -133,13 +151,22 @@ function restoreCatalog(catalog: Snapshot['catalogs'][string]): Snapshot['catalo
     ...workspace, sessionIds: [...new Set(workspace.sessionIds)],
   }))}
 }
+function validFollowResume(value: BrowseEntry['followResume']): value is { hash: string; cursor: number; truncated?: boolean } {
+  return value !== undefined
+    && /^[a-f0-9]{64}$/.test(value.hash)
+    && Number.isSafeInteger(value.cursor)
+    && value.cursor >= 0
+    && (value.truncated === undefined || value.truncated === true)
+}
 function savedEntry(value: BrowseEntry): BrowseEntry {
   const messages = sanitizeCachedMessages(value.messages)
   return { draft: value.draft, position: value.position, starred: value.starred,
     seenAt: value.seenAt, visitedAt: value.visitedAt,
     session: value.session === undefined ? undefined : safeSession(value.session),
     groupRounds: sanitizeGroupRounds(value.groupRounds),
-    ...(messages !== undefined ? { messages } : {}) }
+    ...(messages !== undefined ? { messages } : {}),
+    ...(validFollowResume(value.followResume) ? { followResume: value.followResume } : {}),
+  }
 }
 function snapshot(): Snapshot {
   const state = useBrowseMemory.getState()
@@ -201,11 +228,21 @@ export function saveBrowseCatalog(scope: string, workspaces: WorkspaceView[], se
   useBrowseMemory.setState(state => ({catalogs: {...state.catalogs, [scope]: catalog}}))
   schedule()
 }
-export function saveSessionMessagesSnapshot(scope: string, id: string, messages: ChatItem[]): void {
-  updateBrowseEntry(scope, id, { messages: sanitizeCachedMessages(messages) })
+export function saveSessionMessagesSnapshot(scope: string, id: string, messages: ChatItem[]): boolean {
+  const cached = sanitizeCachedMessages(messages)
+  updateBrowseEntry(scope, id, { messages: cached })
+  const validCount = messages.filter(isValidCachedChatItem).length
+  return cached !== undefined && cached.length < validCount
 }
 export function getCachedSessionMessages(scope: string, id: string): ChatItem[] | undefined {
   return useBrowseMemory.getState().entries[browseKey(scope, id)]?.messages
+}
+export function saveFollowResume(scope: string, id: string, hash: string, cursor: number, truncated = false): void {
+  if (!/^[a-f0-9]{64}$/.test(hash) || !Number.isSafeInteger(cursor) || cursor < 0) return
+  updateBrowseEntry(scope, id, { followResume: { hash, cursor, ...(truncated ? { truncated: true } : {}) } })
+}
+export function getFollowResume(scope: string, id: string): { hash: string; cursor: number; truncated?: boolean } | undefined {
+  return useBrowseMemory.getState().entries[browseKey(scope, id)]?.followResume
 }
 export function browsePreference(patch: Partial<Pick<Snapshot, 'resume' | 'autoConnectHost' | 'notifications' | 'last'>>): void {
   useBrowseMemory.setState(patch); schedule()

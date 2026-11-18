@@ -9,6 +9,7 @@ import {
   MAX_RELAY_FRAME_BYTES,
   SERVER_SHUTDOWN_CLOSE_CODE,
   SERVER_SHUTDOWN_CLOSE_REASON,
+  RELAY2_CAPABILITY,
   type ControlFrame,
   type HelloPayload,
   type ConnectRequestPayload,
@@ -18,6 +19,7 @@ import {
 } from '@dsh-remote/protocol'
 import { ApiError, Store } from './store.js'
 import { Logger, type LogLevel } from './logger.js'
+import { Relay2Hub } from './relay2.js'
 import { normalizeGatewayOptions, normalizeMaxFramesPerSec, type GatewayTimingOptions } from './config.js'
 
 export interface GatewayOptions extends GatewayTimingOptions {
@@ -47,6 +49,7 @@ type Peer = {
   ws: WebSocket
   id: string
   role: 'host' | 'client'
+  relayBase: string
   capabilities: string[]
   version: string
   lastPong: number
@@ -105,7 +108,7 @@ function peerSocket(ws: WebSocket): Socket | undefined {
   const socket = (ws as WebSocket & { _socket?: Socket | null })._socket
   return socket ?? undefined
 }
-const SUPPORTED_TRANSPORTS = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay'] as const
+const SUPPORTED_TRANSPORTS = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', RELAY2_CAPABILITY] as const
 const TRANSPORT_NAMES = ['lan', 'p2p', 'turn', 'relay'] as const
 type TransportName = (typeof TRANSPORT_NAMES)[number]
 
@@ -180,6 +183,7 @@ export class Gateway {
   private readonly relayQueueHardBytes: number
   private readonly relayQueueGlobalSoftBytes: number
   private readonly relayQueueGlobalHardBytes: number
+  private readonly relay2: Relay2Hub
   private queuedBytes = 0
   private maintainTimer: ReturnType<typeof setInterval>
 
@@ -199,13 +203,16 @@ export class Gateway {
     this.relayQueueGlobalHardBytes = Math.min(1024 * 1024 * 1024, Math.max(this.relayQueueGlobalSoftBytes, this.relayQueueHardBytes * 4))
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
+    this.relay2 = new Relay2Hub(origin)
 
     store.onInvalidate = (accountKey, deviceId) => this.disconnect(peerKey(accountKey, deviceId), 'AUTH_INVALID')
     server.on('upgrade', (req, socket, head) => {
       const path = requestPath(req.url)
       // The route still requires an exact match: a query string is rejected
       // (exactly as before) but only its parsed pathname is ever logged.
-      const pathRejected = req.url !== '/ws/v1/connect'
+      const connectPath = req.url === '/ws/v1/connect'
+      const relay2Path = req.url === '/ws/v1/relay2'
+      const pathRejected = !connectPath && !relay2Path
       const originRejected = Boolean(req.headers.origin) && req.headers.origin !== origin
       if (pathRejected || originRejected || this.wss.clients.size >= MAX_SOCKETS) {
         this.logger.warn('ws_upgrade_rejected', {
@@ -225,7 +232,11 @@ export class Gateway {
       }
       const rawSocket = socket as unknown as { setNoDelay?: (noDelay: boolean) => void }
       rawSocket.setNoDelay?.(true)
-      this.wss.handleUpgrade(req, socket, head, ws => this.accept(ws))
+      if (req.url === '/ws/v1/relay2') {
+        this.relay2.handleUpgrade(req, socket, head)
+        return
+      }
+      this.wss.handleUpgrade(req, socket, head, ws => this.accept(ws, this.relay2.endpointFor(req)))
     })
     this.heartbeat = setInterval(() => {
       if (this.closed) return
@@ -462,8 +473,27 @@ export class Gateway {
       peer.heldFor = undefined
     }
   }
+  private relay2Fields(link: Link, role: 'host' | 'client'): { relay2Endpoint?: string; relay2Ticket?: string } {
+    const self = this.peers.get(role === 'host' ? link.hostKey : link.clientKey)
+    const other = this.peers.get(role === 'host' ? link.clientKey : link.hostKey)
+    if (self === undefined || other === undefined) return {}
+    if (!self.capabilities.includes(RELAY2_CAPABILITY) || !other.capabilities.includes(RELAY2_CAPABILITY)) return {}
+    if (self.relayBase.length === 0) return {}
+    return {
+      relay2Endpoint: self.relayBase,
+      relay2Ticket: this.relay2.issue(link.id, role, self.accountKey),
+    }
+  }
+
+  private withRelay2(link: Link, role: 'host' | 'client', frame: ControlFrame): ControlFrame {
+    const extra = this.relay2Fields(link, role)
+    if (extra.relay2Ticket === undefined) return frame
+    return { ...frame, payload: { ...(frame.payload as Record<string, unknown>), ...extra } }
+  }
+
   private drop(link: Link, code: string): void {
     this.links.delete(link.id)
+    this.relay2.closeConnection(link.id)
     this.recordDroppedLink(link)
     for (const key of [link.hostKey, link.clientKey]) {
       const p = this.peers.get(key)
@@ -510,7 +540,7 @@ export class Gateway {
     return this.supportedCapabilities().filter(capability => offered.includes(capability))
   }
 
-  private accept(ws: WebSocket): void {
+  private accept(ws: WebSocket, relayBase: string): void {
     let state: ConnectionState = 'awaiting_hello'
     let peer: Peer | undefined
     let deadline: ReturnType<typeof setTimeout> | undefined
@@ -641,6 +671,7 @@ export class Gateway {
           peer = {
             key, accountKey: authenticated.accountKey, ws, id: device.deviceId, role: device.role,
             capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion,
+            relayBase,
             lastPong: now, lastProgressAt: now, urgent: [], bulk: [], urgentBytes: 0, bulkBytes: 0,
             pumping: false, drainArmed: false, held: false, heldAt: 0, pulseBudget: 0, waiters: new Set(),
           }
@@ -763,6 +794,7 @@ export class Gateway {
         clientIdentityKey: this.store.get(peer.id, peer.accountKey).descriptor.identityKey,
         authorization: 'account',
         preferredTransports: link.preferredTransports,
+        ...this.relay2Fields(link, 'host'),
       }))
       return
     }
@@ -778,10 +810,11 @@ export class Gateway {
       if (peer.id !== link.host || link.stage !== 'pending') throw new ApiError('INVALID_MESSAGE')
       if (frame.type === 'connect.rejected') {
         this.links.delete(link.id)
+        this.relay2.closeConnection(link.id)
         this.recordDroppedLink(link)
       }
       else link.stage = 'accepted'
-      this.send(other, frame, peer)
+      this.send(other, frame.type === 'connect.accepted' ? this.withRelay2(link, 'client', frame) : frame, peer)
       return
     }
     if (p.targetDeviceId !== otherId || link.stage === 'pending') throw new ApiError('CONNECTION_NOT_FOUND')
@@ -859,6 +892,7 @@ export class Gateway {
     this.closed = true
     clearInterval(this.heartbeat)
     clearInterval(this.maintainTimer)
+    this.relay2.close()
     this.logger.info('ws_gateway_closing', { clientCount: this.wss.clients.size })
     for (const ws of this.wss.clients) {
       // Give resumable clients an explicit, unambiguous shutdown signal. A

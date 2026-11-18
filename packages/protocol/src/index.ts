@@ -8,6 +8,7 @@ import { z } from 'zod'
 
 export const WEBRTC_RESUME_CAPABILITY = 'transport.webrtc.resume.v1'
 export const RELAY_RESUME_CAPABILITY = 'transport.relay.resume.v1'
+export { RELAY2_CAPABILITY, encodeRelay2Attach, encodeRelay2Ready, encodeRelay2Data, decodeRelay2Frame, followSnapshotHash, resumeFollowSnapshot, type Relay2Attach, type Relay2Frame, type FollowResume } from './relay2.js'
 export const WEBRTC_LEASE_MS = 300_000
 import { SERVER_SHUTDOWN_REASON as SERVER_SHUTDOWN_REASON_NAME } from './close-semantics.js'
 export {
@@ -404,6 +405,9 @@ export interface ConnectIncomingPayload {
   relayTicket?: string
   relayNodeId?: string
   relayEpoch?: number
+  /** Binary relay socket. Older clients ignore it and keep using JSON relay frames. */
+  relay2Endpoint?: string
+  relay2Ticket?: string
 }
 
 export interface ConnectAcceptedPayload {
@@ -415,6 +419,9 @@ export interface ConnectAcceptedPayload {
   relayTicket?: string
   relayNodeId?: string
   relayEpoch?: number
+  /** Binary relay socket. Older clients ignore it and keep using JSON relay frames. */
+  relay2Endpoint?: string
+  relay2Ticket?: string
 }
 
 export interface ConnectRejectedPayload {
@@ -1173,6 +1180,15 @@ export const connectIncomingPayloadSchema = z.object({
   relayTicket: z.string().min(1).optional(),
   relayNodeId: z.string().min(1).optional(),
   relayEpoch: z.number().int().nonnegative().optional(),
+  relay2Endpoint: z.string().min(8).max(2048).refine(value => {
+    try {
+      const url = new URL(value)
+      return (url.protocol === 'ws:' || url.protocol === 'wss:') && url.pathname === '/ws/v1/relay2'
+    } catch {
+      return false
+    }
+  }).optional(),
+  relay2Ticket: z.string().min(16).max(128).optional(),
 })
 
 export const connectAcceptedPayloadSchema = z.object({
@@ -1183,6 +1199,15 @@ export const connectAcceptedPayloadSchema = z.object({
   relayTicket: z.string().min(1).optional(),
   relayNodeId: z.string().min(1).optional(),
   relayEpoch: z.number().int().nonnegative().optional(),
+  relay2Endpoint: z.string().min(8).max(2048).refine(value => {
+    try {
+      const url = new URL(value)
+      return (url.protocol === 'ws:' || url.protocol === 'wss:') && url.pathname === '/ws/v1/relay2'
+    } catch {
+      return false
+    }
+  }).optional(),
+  relay2Ticket: z.string().min(16).max(128).optional(),
 })
 
 export const connectRejectedPayloadSchema = z.object({

@@ -24,6 +24,8 @@ import {
   MAX_HARNESS_API_TRANSFER_BYTES,
   MAX_SECURE_MESSAGE_BYTES,
   TRANSFER_IDLE_MS,
+  resumeFollowSnapshot,
+  type FollowResume,
 } from '@dsh-remote/protocol'
 import { z } from 'zod'
 import { TerminalPolicy, TERMINAL_CALLS, TERMINAL_STREAMS } from './terminal-policy.js'
@@ -575,6 +577,8 @@ export class HarnessRemoteBridge {
     if (this.streams.size >= MAX_ACTIVE_STREAMS) {
       throw new RpcError('RATE_LIMITED', 'Too many Harness Remote streams are open.', undefined, true)
     }
+    const follow = params.endpoint === 'session/follow' ? takeFollowResume(params.payload) : undefined
+    const streamPayload = follow?.payload ?? params.payload
     const controller = new AbortController()
     this.streams.set(params.streamId, { controller })
     let source: AsyncIterable<unknown>
@@ -582,7 +586,7 @@ export class HarnessRemoteBridge {
       source = (this.codexWorkspace === undefined ? undefined : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal))
         ?? await (params.endpoint === 'terminal/follow' && this.terminalCarrier !== undefined
           ? this.terminalCarrier.open(params.payload, controller.signal)
-          : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, params.payload, this.harnessVersion), controller.signal))
+          : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, streamPayload, this.harnessVersion), controller.signal))
       controller.signal.throwIfAborted()
     } catch (error) {
       this.streams.delete(params.streamId)
@@ -590,7 +594,7 @@ export class HarnessRemoteBridge {
       throw error
     }
     if (params.endpoint === '$events') source = this.remoteEventsWithFallback(source, controller.signal)
-    void this.pump(params.streamId, source, controller.signal, params.endpoint === 'session/follow', params.transferFrames)
+    void this.pump(params.streamId, source, controller.signal, params.endpoint === 'session/follow', params.transferFrames, follow?.resume)
     return { opened: true, streamId: params.streamId }
   }
 
@@ -712,16 +716,18 @@ export class HarnessRemoteBridge {
     }
   }
 
-  private async pump(streamId: string, source: AsyncIterable<unknown>, signal: AbortSignal, historyFollow = false, transferFrames = false): Promise<void> {
+  private async pump(streamId: string, source: AsyncIterable<unknown>, signal: AbortSignal, historyFollow = false, transferFrames = false, resume?: FollowResume): Promise<void> {
     let reason: HarnessRemoteStreamClosedData['reason'] = 'completed'
     let failure: HarnessRemoteStreamClosedData['failure']
     try {
       for await (const value of source) {
         if (signal.aborted) break
+        const sent = historyFollow && this.compactHistoryEnabled && isCompactSnapshot(value) ? compactHistory(value) : value
+        const resumed = historyFollow && isRecord(sent) ? resumeFollowSnapshot(sent, resume) : sent
         const frame: HarnessRemoteFrameData = {
           streamId,
           hasValue: true,
-          ...(value === undefined ? {} : { value: historyFollow && this.compactHistoryEnabled && isCompactSnapshot(value) ? compactHistory(value) : value }),
+          ...(value === undefined ? {} : { value: resumed }),
         }
         if (encodeMessage(createEvent('harness.remote.frame', frame)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
           if (!transferFrames) throw new Error('Oversized Harness Remote frame')
@@ -1503,6 +1509,17 @@ function record(value: unknown): Record<string, unknown> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function takeFollowResume(payload: unknown): { payload: unknown; resume?: FollowResume } {
+  if (!isRecord(payload) || !isRecord(payload.args) || !isRecord(payload.args.request) || !Object.hasOwn(payload.args.request, 'resume')) {
+    return { payload }
+  }
+  const request = payload.args.request
+  const { resume, ...rest } = request
+  const next = { ...payload, args: { ...payload.args, request: rest } }
+  if (!isRecord(resume) || typeof resume.hash !== 'string' || typeof resume.cursor !== 'number') return { payload: next }
+  return { payload: next, resume: { hash: resume.hash, cursor: resume.cursor } }
 }
 
 function isCompactSnapshot(value: unknown): boolean {

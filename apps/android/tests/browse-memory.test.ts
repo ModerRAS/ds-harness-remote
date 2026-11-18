@@ -49,20 +49,33 @@ it('restores encrypted scoped drafts and sanitized message snapshots without raw
   await b.clearBrowseMemory(); const c = await load(); expect(c.useBrowseMemory.getState().entries).toEqual({})
 })
 
-it('enforces MAX_CACHED_MESSAGES_PER_SESSION (30) limit on messages snapshot', async () => {
+it('keeps a recent transcript tail and drops the oldest text once the cache budget is full', async () => {
   const a = await load()
   const scope = 'scope-1'
-  const msgs = Array.from({ length: 45 }, (_, i) => ({
+  const count = a.MAX_CACHED_MESSAGES_PER_SESSION + 1
+  const msgs = Array.from({ length: count }, (_, i) => ({
     id: `msg-${i}`, kind: 'message' as const, role: 'user' as const, text: `hello ${i}`
   }))
-  a.saveSessionMessagesSnapshot(scope, 's-long', msgs as never)
+  expect(a.saveSessionMessagesSnapshot(scope, 's-long', msgs as never)).toBe(true)
   await a.flushBrowseMemory()
   const b = await load()
   const cached = b.getCachedSessionMessages(scope, 's-long')
-  expect(cached).toBeDefined()
-  expect(cached).toHaveLength(30)
-  expect(cached![0]!.id).toBe('msg-15')
-  expect(cached![29]!.id).toBe('msg-44')
+  expect(cached).toHaveLength(a.MAX_CACHED_MESSAGES_PER_SESSION)
+  expect(cached![0]!.id).toBe('msg-1')
+  expect(cached!.at(-1)!.id).toBe(`msg-${count - 1}`)
+
+  const bulky = Array.from({ length: 80 }, (_, i) => ({
+    id: `bulk-${i}`, kind: 'message' as const, role: 'assistant' as const, text: 'x'.repeat(40_000),
+  }))
+  expect(a.saveSessionMessagesSnapshot(scope, 's-bulk', bulky as never)).toBe(true)
+  const tail = a.getCachedSessionMessages(scope, 's-bulk')
+  expect(tail).toBeDefined()
+  expect(tail!.length).toBeGreaterThan(1)
+  expect(tail!.length).toBeLessThan(80)
+  expect(tail!.at(-1)!.id).toBe('bulk-79')
+  const hash = 'ab'.repeat(32)
+  a.saveFollowResume(scope, 's-bulk', hash, 12, true)
+  expect(a.getFollowResume(scope, 's-bulk')).toEqual({ hash, cursor: 12, truncated: true })
 })
 
 it('enforces MAX_CACHED_SESSIONS (10) LRU eviction across sessions', async () => {

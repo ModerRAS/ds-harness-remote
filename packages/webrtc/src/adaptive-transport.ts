@@ -1,19 +1,23 @@
 import { ControlLease } from './control-lease.js'
-import { waitForRelayCapacity } from './websocket-backpressure.js'
+import { waitForRelayCapacity, waitForRelay2Capacity } from './websocket-backpressure.js'
 import {
   PROTOCOL_VERSION,
   errorCodeSchema,
   type ErrorCode,
   WEBRTC_RESUME_CAPABILITY,
   RELAY_RESUME_CAPABILITY,
+  RELAY2_CAPABILITY,
   type ConnectionLeaseAck,
   acceptNegotiatedCapabilities,
   createControlFrame,
   createRelayDataFrame,
   decodeControlFrame,
   decodeRelayDataFrame,
+  decodeRelay2Frame,
   encodeControlFrame,
   encodeRelayDataFrame,
+  encodeRelay2Attach,
+  encodeRelay2Data,
   type ControlFrameByteLimits,
   type ConnectAcceptedPayload,
   type HelloAckPayload,
@@ -86,7 +90,7 @@ export interface AdaptiveConnectionDetails {
   webRtc?: RtcConnectionDetails
 }
 
-const DEFAULT_CAPABILITIES = [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, 'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', 'harness.api.v1']
+const DEFAULT_CAPABILITIES = [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, 'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', RELAY2_CAPABILITY, 'harness.api.v1']
 const DEFAULT_PREFERRED_TRANSPORTS = ['lan', 'p2p', 'turn', 'relay'] as const
 
 /**
@@ -125,6 +129,9 @@ export class AdaptiveTransport extends BaseTransport {
   private lastControlSentAt?: number
   private lastRtcDiagnostics?: RtcConnectionDiagnostics
   private relayAssignment?: RelayAssignment
+  private relay2Assignment?: { endpoint: string; ticket: string }
+  private relay2Socket?: WebSocket
+  private relay2Ready = false
   private dataReady = false
   private recoveryTicket?: string
   private relayRecoveryTicket?: string
@@ -197,6 +204,13 @@ export class AdaptiveTransport extends BaseTransport {
       return
     }
     const socket = this.dataSocket ?? this.socket
+    if (this.relay2Ready && this.relay2Socket?.readyState === WebSocket.OPEN) {
+      await waitForRelay2Capacity(this.relay2Socket)
+      this.relay2Socket.send(encodeRelay2Data(this.relayCounter, data))
+      this.bytesSent += data.byteLength
+      this.relayCounter += 1
+      return
+    }
     if (socket?.readyState !== WebSocket.OPEN) throw new Error('adaptive transport is not connected')
     await waitForRelayCapacity(socket)
     const payload = {
@@ -330,6 +344,9 @@ export class AdaptiveTransport extends BaseTransport {
         if (typeof assignment.relayEndpoint === 'string' && typeof assignment.relayTicket === 'string') {
           this.relayAssignment = assignment
         }
+        if (typeof payload.relay2Endpoint === 'string' && typeof payload.relay2Ticket === 'string') {
+          this.relay2Assignment = { endpoint: payload.relay2Endpoint, ticket: payload.relay2Ticket }
+        }
         this.clearHandshake()
         void this.negotiate(lifetime.signal).catch(error => {
           if (this.lifetime === lifetime) this.failConnection(error instanceof Error ? error : new Error('Adaptive transport negotiation failed'))
@@ -353,7 +370,7 @@ export class AdaptiveTransport extends BaseTransport {
         return
       }
       if (frame.type === 'relay') {
-        if (this.dataSocket !== undefined) return
+        if (this.dataSocket !== undefined || this.relay2Ready) return
         if (this.dataMode !== 'relay') return
         this.handleRelay(frame.payload as Partial<RelayPayload>)
         return
@@ -450,7 +467,16 @@ export class AdaptiveTransport extends BaseTransport {
       selected = 'relay'
     }
     this.selected = selected
-    if (selected === 'relay' && this.relayAssignment !== undefined) {
+    if (selected === 'relay' && this.relay2Assignment !== undefined) {
+      try {
+        await this.openRelay2(this.relay2Assignment)
+      } catch {
+        this.relay2Socket?.close()
+        this.relay2Socket = undefined
+        this.relay2Ready = false
+      }
+    }
+    if (selected === 'relay' && !this.relay2Ready && this.relayAssignment !== undefined) {
       await this.openDataSocket(this.relayAssignment)
     }
     const turnNode = selected === 'turn' ? this.rtc?.selectedRelayUrl() : undefined
@@ -671,6 +697,54 @@ export class AdaptiveTransport extends BaseTransport {
     }
   }
 
+  private async openRelay2(assignment: { endpoint: string; ticket: string }): Promise<void> {
+    if (this.connectionId === undefined || this.relay2Socket !== undefined) return
+    const connectionId = this.connectionId
+    const socket = new WebSocket(assignment.endpoint)
+    socket.binaryType = 'arraybuffer'
+    this.relay2Socket = socket
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => finish(new Error('Relay2 attach timed out')), 15_000)
+      const finish = (error?: Error): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (error === undefined) resolve()
+        else reject(error)
+      }
+      socket.onopen = () => {
+        socket.send(encodeRelay2Attach({
+          ticket: assignment.ticket,
+          connectionId,
+          deviceId: this.options.deviceId,
+        }))
+      }
+      socket.onmessage = event => {
+        void relay2Bytes(event.data).then(bytes => {
+          const frame = decodeRelay2Frame(bytes)
+          if (frame.type === 'ready') {
+            this.relay2Ready = true
+            finish()
+            return
+          }
+          if (frame.type !== 'data' || !this.relay2Ready) return
+          this.bytesReceived += frame.ciphertext.byteLength
+          this.emit(frame.ciphertext)
+        }).catch(error => {
+          const failure = error instanceof Error ? error : new Error('Relay2 frame failed')
+          finish(failure)
+          this.failConnection(failure)
+        })
+      }
+      socket.onerror = () => finish(new Error('Relay2 socket failed'))
+      socket.onclose = () => {
+        if (!this.relay2Ready) finish(new Error('Relay2 socket closed before ready'))
+        else this.failConnection(new Error('Relay2 socket closed'))
+      }
+    })
+  }
+
   private async openDataSocket(assignment: RelayAssignment): Promise<void> {
     if (this.connectionId === undefined || this.dataSocket !== undefined) return
     const socket = new WebSocket(assignment.relayEndpoint!)
@@ -798,17 +872,22 @@ export class AdaptiveTransport extends BaseTransport {
     const rtc = this.rtc
     const socket = this.socket
     const dataSocket = this.dataSocket
+    const relay2Socket = this.relay2Socket
     this.rtc = undefined
     this.socket = undefined
     this.dataSocket = undefined
+    this.relay2Socket = undefined
     this.dataReady = false
+    this.relay2Ready = false
     this.relayAssignment = undefined
+    this.relay2Assignment = undefined
     this.connectionId = undefined
     this.connectedAt = undefined
     lifetime?.abort()
     reject?.(error)
     void rtc?.close()
     dataSocket?.close()
+    relay2Socket?.close()
     socket?.close()
     if (established && diagnostic !== undefined) {
       try { this.options.onDisconnect?.(diagnostic) } catch { /* diagnostics must not prevent close */ }
@@ -894,4 +973,12 @@ const SERVER_NEGOTIATE_TIMEOUT_MAX_MS = 12_000
 // React Native AbortSignal implementations may omit throwIfAborted().
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new Error('Adaptive connection was aborted')
+}
+
+async function relay2Bytes(data: unknown): Promise<Uint8Array> {
+  if (data instanceof Uint8Array) return data
+  if (data instanceof ArrayBuffer) return new Uint8Array(data)
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  if (typeof Blob !== 'undefined' && data instanceof Blob) return new Uint8Array(await data.arrayBuffer())
+  throw new Error('Relay2 frame must be binary.')
 }

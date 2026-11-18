@@ -140,7 +140,7 @@ beforeEach(prepareContract1)
     await connection.connect('https://remote.example', identity, host, 'access-token', true)
     expect(testState.transportOptions).toHaveLength(1)
     expect(testState.transportOptions[0]?.capabilities).toEqual([
-      'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', 'harness.api.v1',
+      'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', 'transport.relay2', 'harness.api.v1',
     ])
     await connection.close()
   })

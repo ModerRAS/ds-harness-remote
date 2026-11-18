@@ -977,7 +977,7 @@ describe('HarnessAlphaClient', () => {
     core.emit({ event: 'harness.remote.frame', data: { streamId: latest.streamId, hasValue: true,
       value: { type: 'snapshot', cursor: 10, records: [], hasMore: false, projections: { asOfSeq: 10, values: { permissions: { currentValue: 'read-only' } } } } } })
     expect(await first).toMatchObject({ code: 'CANCELLED' })
-    expect(await second).toEqual({ events: [], hasMore: false, throughSeq: 10 })
+    expect(await second).toMatchObject({ events: [], hasMore: false, throughSeq: 10 })
     expect(frames).toMatchObject([{ payload: { sessionId: 'new', key: 'permissions', value: { currentValue: 'read-only' } } }])
     expect(frames).toHaveLength(1)
     await client.close()
@@ -1137,7 +1137,7 @@ describe('HarnessAlphaClient', () => {
       },
     })
 
-    await expect(history).resolves.toEqual({
+    await expect(history).resolves.toMatchObject({
       hasMore: false,
       throughSeq: 9,
       events: [
@@ -1173,7 +1173,7 @@ describe('HarnessAlphaClient', () => {
       } }], hasMore: false,
       projections: { asOfSeq: 4, values: {} }, assistantStream: { revision: 0 },
     } } })
-    await expect(history).resolves.toEqual({ events: [{ event: {
+    await expect(history).resolves.toMatchObject({ events: [{ event: {
       type: 'tool/result', seq: 4, time: 100, data: {}, sourceEventSeqs: [3],
       surfaceOp: { op: 'replace', startSeq: 3, endSeq: 3 },
     } }], hasMore: false, throughSeq: 4 })

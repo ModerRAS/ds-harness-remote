@@ -8,7 +8,7 @@ import { once } from 'node:events'
 import { createConnection } from 'node:net'
 import { request as httpRequest } from 'node:http'
 import { WebSocket } from 'ws'
-import { MAX_CONTROL_FRAME_BYTES, createControlFrame } from '@dsh-remote/protocol'
+import { MAX_CONTROL_FRAME_BYTES, createControlFrame, decodeRelay2Frame, encodeRelay2Attach, encodeRelay2Data } from '@dsh-remote/protocol'
 import { NoiseIkSession, createNoisePrologue, generateKeyPair, toBase64Url, fromBase64Url } from '../../../packages/crypto/src/index.js'
 import { RelayTransport } from '../../../packages/webrtc/src/index.js'
 import { ClientSecureTransport } from '../../../packages/plugin/src/client-secure-transport.js'
@@ -1528,5 +1528,64 @@ describe('account isolation', () => {
     const renamed = await request('/auth/login', 'POST', { email: 'second@example.com', password: 'second-password' })
     expect(renamed.status).toBe(200)
     expect((await request('/account/devices', 'GET', undefined, renamed.data.token)).data.items.map((item: { name: string }) => item.name).sort()).toEqual(['client-b', 'renamed-b'])
+  })
+})
+
+describe('binary relay2', () => {
+  it('splices binary frames on a side socket and leaves both control sockets open', async () => {
+    const caps = [...fullCapabilities, 'transport.relay2']
+    const h = await device('host')
+    const c = await device()
+    const host = await socket(h, { capabilities: caps })
+    const client = await socket(c, { capabilities: caps })
+    await host.next('hello.ack')
+    await client.next('hello.ack')
+    client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
+    const incoming = await host.next('connect.incoming')
+    expect(incoming.relay2Endpoint).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/ws\/v1\/relay2$/)
+    expect(incoming.relay2Ticket).toEqual(expect.any(String))
+    host.send('connect.accepted', { connectionId: incoming.connectionId })
+    const accepted = await client.next('connect.accepted')
+    expect(accepted.relay2Endpoint).toBe(incoming.relay2Endpoint)
+    expect(accepted.relay2Ticket).not.toBe(incoming.relay2Ticket)
+
+    const hostRelay = new WebSocket(incoming.relay2Endpoint)
+    const clientRelay = new WebSocket(accepted.relay2Endpoint)
+    sockets.push(hostRelay, clientRelay)
+    const hostFrames: Buffer[] = []
+    const clientFrames: Buffer[] = []
+    hostRelay.on('message', data => { hostFrames.push(Buffer.from(data as Buffer)) })
+    clientRelay.on('message', data => { clientFrames.push(Buffer.from(data as Buffer)) })
+    await once(hostRelay, 'open')
+    await once(clientRelay, 'open')
+    hostRelay.send(encodeRelay2Attach({ ticket: incoming.relay2Ticket, connectionId: incoming.connectionId, deviceId: h.deviceId }))
+    clientRelay.send(encodeRelay2Attach({ ticket: accepted.relay2Ticket, connectionId: accepted.connectionId, deviceId: c.deviceId }))
+    const nextFrame = async (frames: Buffer[], index: number): Promise<Buffer> => {
+      const until = Date.now() + 3000
+      while (Date.now() < until) {
+        const frame = frames[index]
+        if (frame !== undefined) return frame
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      throw new Error(`Missing relay2 frame ${index}`)
+    }
+    expect(decodeRelay2Frame(await nextFrame(hostFrames, 0))).toEqual({ type: 'ready' })
+    expect(decodeRelay2Frame(await nextFrame(clientFrames, 0))).toEqual({ type: 'ready' })
+    const payload = new Uint8Array(64 * 1024)
+    for (let counter = 0; counter < 8; counter += 1) {
+      payload[0] = counter
+      clientRelay.send(encodeRelay2Data(counter, payload))
+    }
+    for (let counter = 0; counter < 8; counter += 1) {
+      const frame = decodeRelay2Frame(await nextFrame(hostFrames, counter + 1))
+      expect(frame).toMatchObject({ type: 'data', counter })
+      if (frame.type === 'data') expect(frame.ciphertext[0]).toBe(counter)
+    }
+    host.send('ping', { nonce: 'relay2-alive' })
+    expect(await host.next('pong')).toEqual({ nonce: 'relay2-alive' })
+    expect(host.ws.readyState).toBe(WebSocket.OPEN)
+    expect(client.ws.readyState).toBe(WebSocket.OPEN)
+    expect(hostRelay.readyState).toBe(WebSocket.OPEN)
+    expect(clientRelay.readyState).toBe(WebSocket.OPEN)
   })
 })

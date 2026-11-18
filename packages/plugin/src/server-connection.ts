@@ -1,4 +1,4 @@
-import { waitForRelayCapacity, SerialSend, ControlLease } from '@dsh-remote/webrtc'
+import { waitForRelayCapacity, waitForRelay2Capacity, SerialSend, ControlLease } from '@dsh-remote/webrtc'
 import {
   NoiseIkSession,
   createNoisePrologue,
@@ -10,6 +10,7 @@ import {
   PROTOCOL_VERSION,
   WEBRTC_RESUME_CAPABILITY,
   RELAY_RESUME_CAPABILITY,
+  RELAY2_CAPABILITY,
   classifyControlClose,
   type ConnectionLeaseAck,
   SecureMessageCodec,
@@ -18,10 +19,13 @@ import {
   createRelayDataFrame,
   decodeControlFrame,
   decodeRelayDataFrame,
+  decodeRelay2Frame,
   decodeMessage,
   encodeControlFrame,
   encodeMessage,
   encodeRelayDataFrame,
+  encodeRelay2Attach,
+  encodeRelay2Data,
   type ControlFrameByteLimits,
   type ConnectIncomingPayload,
   type ControlErrorPayload,
@@ -60,7 +64,7 @@ interface WebSocketLike {
   onmessage: ((event: { data: unknown }) => void) | null
   onerror: ((event: unknown) => void) | null
   onclose: ((event: { code: number; reason: string }) => void) | null
-  send(data: string): void
+  send(data: string | Uint8Array): void
   close(code?: number, reason?: string): void
 }
 
@@ -85,8 +89,11 @@ interface PendingTunnel {
   /** ICE candidates that arrived while the offer handler was still preparing the RTC backend. */
   pendingIce?: SignalIcePayload['candidate'][]
   relayAssignment?: RelayAssignment
+  relay2Assignment?: { endpoint: string; ticket: string }
   dataSocket?: WebSocketLike
   dataReady?: boolean
+  relay2Socket?: WebSocketLike
+  relay2Ready?: boolean
 }
 
 const DEFAULT_WEBRTC_NEGOTIATE_TIMEOUT_MS = 12_000
@@ -247,8 +254,8 @@ export class HostServerConnection {
     const credentials = await this.api.authenticate(this.identity)
     if (this.stopped) return
     const offeredCapabilities = this.rtcFactoryProvider === undefined || this.config.forceRelay
-      ? [RELAY_RESUME_CAPABILITY, 'transport.relay', 'transport.relay.attach', ...this.hostCapabilities()]
-      : [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, 'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', ...this.hostCapabilities()]
+      ? [RELAY_RESUME_CAPABILITY, 'transport.relay', 'transport.relay.attach', RELAY2_CAPABILITY, ...this.hostCapabilities()]
+      : [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, 'transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay', 'transport.relay.attach', RELAY2_CAPABILITY, ...this.hostCapabilities()]
     const recoveryTickets = [...this.tunnels.values()].flatMap(tunnel => tunnel.lease?.recoveryTicket() ?? []).slice(0, 64)
     const socket = this.createWebSocket(websocketUrl(this.api.baseUrl))
     this.socket = socket
@@ -588,7 +595,8 @@ export class HostServerConnection {
     }
     if (frame.type === 'relay') {
       const payload = requireRelay(frame.payload)
-      if (this.tunnels.get(payload.connectionId)?.dataSocket !== undefined) return
+      const tunnel = this.tunnels.get(payload.connectionId)
+      if (tunnel?.dataSocket !== undefined || tunnel?.relay2Ready === true) return
       await this.handleRelay(payload)
       return
     }
@@ -736,6 +744,9 @@ export class HostServerConnection {
       ...(typeof payload.relayEndpoint === 'string' && typeof payload.relayTicket === 'string'
         ? { relayAssignment: payload as RelayAssignment }
         : {}),
+      ...(typeof payload.relay2Endpoint === 'string' && typeof payload.relay2Ticket === 'string'
+        ? { relay2Assignment: { endpoint: payload.relay2Endpoint, ticket: payload.relay2Ticket } }
+        : {}),
     }
     this.tunnels.set(payload.connectionId, tunnel)
     this.sendControl('connect.accepted', { connectionId: payload.connectionId })
@@ -804,8 +815,11 @@ export class HostServerConnection {
         })
       }
       tunnel.dataSocket?.close()
+      tunnel.relay2Socket?.close()
       tunnel.dataSocket = undefined
+      tunnel.relay2Socket = undefined
       tunnel.dataReady = false
+      tunnel.relay2Ready = false
     }, mode)
     tunnel.channel = channel
     await this.connections.accept(channel)
@@ -995,7 +1009,21 @@ export class HostServerConnection {
       tunnel.transport = 'relay'
       tunnel.transportMode = undefined
       await rtc?.close()
-      if (tunnel.relayAssignment !== undefined) {
+      if (tunnel.relay2Assignment !== undefined && tunnel.relay2Ready !== true) {
+        try {
+          await this.openRelay2(tunnel)
+        } catch (error) {
+          this.logger.warn('relay2 attach failed; using the JSON relay', {
+            connectionId: shortId(tunnel.connectionId),
+            peerDeviceId: shortId(tunnel.peer.deviceId),
+            reason: diagnosticReason(error),
+          })
+          tunnel.relay2Socket?.close()
+          tunnel.relay2Socket = undefined
+          tunnel.relay2Ready = false
+        }
+      }
+      if (!tunnel.relay2Ready && tunnel.relayAssignment !== undefined) {
         try {
           await this.openDataSocket(tunnel)
         } catch (error) {
@@ -1158,8 +1186,13 @@ export class HostServerConnection {
     }
     const counter = Number(tunnel.noise.sendingCounter() - 1n)
     if (!Number.isSafeInteger(counter) || counter < 0) throw new ControlConnectionError('FRAME_TOO_LARGE', 'Noise transport counter overflowed.')
-    const socket = tunnel.dataSocket ?? this.socket
+    const socket = tunnel.relay2Ready ? tunnel.relay2Socket : tunnel.dataSocket ?? this.socket
     if (socket === undefined) throw new Error('Relay transport closed')
+    if (tunnel.relay2Ready && tunnel.relay2Socket?.readyState === 1) {
+      await waitForRelay2Capacity(tunnel.relay2Socket)
+      tunnel.relay2Socket.send(encodeRelay2Data(counter, ciphertext))
+      return
+    }
     await waitForRelayCapacity(socket)
     if (this.tunnels.get(tunnel.connectionId) !== tunnel || tunnel.channel === undefined) {
       throw new Error('Relay tunnel closed')
@@ -1183,6 +1216,57 @@ export class HostServerConnection {
       counter,
       ciphertext: toBase64Url(ciphertext),
     } satisfies RelayPayload)
+  }
+
+  private async openRelay2(tunnel: PendingTunnel): Promise<void> {
+    const assignment = tunnel.relay2Assignment
+    if (assignment === undefined || tunnel.relay2Socket !== undefined) return
+    const socket = this.createWebSocket(assignment.endpoint)
+    socket.binaryType = 'arraybuffer'
+    tunnel.relay2Socket = socket
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => finish(new Error('Relay2 attach timed out')), 15_000)
+      const finish = (error?: Error): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (error === undefined) resolve()
+        else reject(error)
+      }
+      socket.onopen = () => {
+        try {
+          socket.send(encodeRelay2Attach({
+            ticket: assignment.ticket,
+            connectionId: tunnel.connectionId,
+            deviceId: this.identity.deviceId,
+          }))
+        } catch (error) {
+          finish(asError(error))
+        }
+      }
+      socket.onmessage = event => {
+        try {
+          const bytes = relay2Bytes(event.data)
+          const frame = decodeRelay2Frame(bytes)
+          if (frame.type === 'ready') {
+            tunnel.relay2Ready = true
+            finish()
+            return
+          }
+          if (frame.type !== 'data' || tunnel.relay2Ready !== true || tunnel.channel === undefined) return
+          tunnel.channel.receive(frame.counter, frame.ciphertext)
+        } catch (error) {
+          finish(asError(error))
+          void this.dropTunnel(tunnel.connectionId, 'CONNECTION_FAILED')
+        }
+      }
+      socket.onerror = () => finish(new Error('Relay2 socket failed'))
+      socket.onclose = () => {
+        if (tunnel.relay2Ready !== true) finish(new Error('Relay2 socket closed before ready'))
+        else void this.dropTunnel(tunnel.connectionId, 'CONNECTION_FAILED')
+      }
+    })
   }
 
   private async openDataSocket(tunnel: PendingTunnel): Promise<void> {
@@ -1282,6 +1366,7 @@ export class HostServerConnection {
       tunnel.lease?.stop()
       if (tunnel.rtc !== undefined) await tunnel.rtc.close()
       tunnel.dataSocket?.close()
+      tunnel.relay2Socket?.close()
       if (tunnel.channel !== undefined) await tunnel.channel.close()
       else tunnel.noise.destroy()
     }))
@@ -1307,8 +1392,11 @@ export class HostServerConnection {
       })
     }
     tunnel.dataSocket?.close()
+    tunnel.relay2Socket?.close()
     tunnel.dataSocket = undefined
+    tunnel.relay2Socket = undefined
     tunnel.dataReady = false
+    tunnel.relay2Ready = false
     if (tunnel.channel !== undefined) {
       try {
         const closed = detail === undefined
@@ -1537,6 +1625,13 @@ function shortId(value: string): string { return value.length <= 12 ? value : `$
 
 /** Client-reported TURN relay hostnames (IPv4/IPv6[:port]) may enter logs. */
 const TURN_NODE_TEXT = /^[A-Za-z0-9.[\]:-]+$/
+function relay2Bytes(data: unknown): Uint8Array {
+  if (data instanceof Uint8Array) return data
+  if (data instanceof ArrayBuffer) return new Uint8Array(data)
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  throw new ControlConnectionError('INVALID_MESSAGE', 'Relay2 frames must be binary.')
+}
+
 function asError(error: unknown): Error { return error instanceof Error ? error : new Error('Unknown Server connection error.') }
 function diagnosticReason(error: unknown): string {
   const message = asError(error).message.replace(/[\r\n]+/g, ' ').slice(0, 160)

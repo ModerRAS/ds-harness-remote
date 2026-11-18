@@ -3,6 +3,8 @@ import { RemoteGatewayError, RemoteTypertGateway, createRemoteId, type RemoteGat
 import type { RemoteClientCore } from './index.js'
 import {
   REMOTE_COMPACTION_CAPABILITY,
+  followSnapshotHash,
+  type FollowResume,
   type RemoteCompactionState,
   type RemoteCompactionStatusResult,
   type RemoteCompactionSubmitResult,
@@ -302,6 +304,10 @@ export interface HarnessSessionHistoryPage {
   events: HarnessHistoryEntry[]
   hasMore: boolean
   throughSeq?: number
+  /** Present when the phone already has this snapshot and the host sent no records. */
+  unchanged?: boolean
+  /** Hash of the raw snapshot. Save it and send it back on the next open. */
+  snapshotHash?: string
 }
 
 type RemoteEventKind = 'approval/request' | 'user-questions/request'
@@ -785,7 +791,7 @@ export class HarnessAlphaClient {
       : { kind: 'subagent' as const, parentSessionId, childSessionId: sessionId, mode: 'unknown' as const }
   }
 
-  async sessionHistory(sessionId: string, beforeSeq?: number, maxMessages = 60, parentSessionId?: string): Promise<HarnessSessionHistoryPage> {
+  async sessionHistory(sessionId: string, beforeSeq?: number, maxMessages = 60, parentSessionId?: string, resume?: FollowResume): Promise<HarnessSessionHistoryPage> {
     if (beforeSeq !== undefined) {
       const throughSeq = this.followCursors.get(sessionId) ?? beforeSeq
       const page = await this.callValue<{ records: unknown[]; hasMore: boolean }>('session/page', {
@@ -813,6 +819,7 @@ export class HarnessAlphaClient {
         request: {
           address: this.sessionAddress(sessionId, parentSessionId),
           maxMessages,
+          ...(resume === undefined ? {} : { resume }),
           ...(this.host.sessionFormat === 3 ? { assistantStream: true as const } : {}),
         },
       },
@@ -837,6 +844,20 @@ export class HarnessAlphaClient {
     }
     const snapshot = first.value
     const cursor = typeof snapshot.cursor === 'number' ? snapshot.cursor : undefined
+    if (snapshot.unchanged === true) {
+      if (cursor !== undefined) this.followCursors.set(sessionId, cursor)
+      if (this.host.sessionFormat === 3) handle.assistant = assistantStreamBaseline(snapshot.assistantStream)
+      this.applyProjectionBaseline(sessionId, snapshot.projections)
+      this.republishPendingSessionInteractions(sessionId, isRecord(snapshot.projections) && isRecord(snapshot.projections.values) && snapshot.projections.values.userQuestions !== undefined)
+      void this.pumpSessionFollow(handle, iterator).catch(error => this.emitStreamFailure(handle, this.sessionFollow, error))
+      return {
+        events: [],
+        hasMore: snapshot.hasMore === true,
+        ...(cursor === undefined ? {} : { throughSeq: cursor }),
+        unchanged: true,
+        ...(resume === undefined ? {} : { snapshotHash: resume.hash }),
+      }
+    }
     if (cursor !== undefined) this.followCursors.set(sessionId, cursor)
     if (this.host.sessionFormat === 3) handle.assistant = assistantStreamBaseline(snapshot.assistantStream)
     this.applyProjectionBaseline(sessionId, snapshot.projections)
@@ -846,6 +867,7 @@ export class HarnessAlphaClient {
       events: historyEntriesFromRecords(Array.isArray(snapshot.records) ? snapshot.records : []),
       hasMore: snapshot.hasMore === true,
       ...(cursor === undefined ? {} : { throughSeq: cursor }),
+      snapshotHash: followSnapshotHash(snapshot),
     }
   }
 
