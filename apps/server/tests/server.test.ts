@@ -1351,7 +1351,7 @@ describe('stale link frame dropping and configurable rate limit', () => {
     expect(hostCloseCode).toBe(4001)
   })
 
-  it('enforces configured maxFramesPerSec on active frames and immediately reaps a heartbeat-expired host on connect.request', async () => {
+  it('keeps an authenticated burst connected and still reaps a heartbeat-expired host on connect.request', async () => {
     await app.close()
     await start(password, [], { maxFramesPerSec: 64 })
     accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
@@ -1379,17 +1379,61 @@ describe('stale link frame dropping and configurable rate limit', () => {
     })
     expect([...app.gateway.peers.values()].some(peer => peer.id === h.deviceId)).toBe(false)
 
-    // Active frames exceeding the configured 64 frames/sec threshold trigger RATE_LIMITED (4001).
-    const noisyClosed = once(noisyWire.ws, 'close')
-    for (let i = 0; i < 70; i++) {
-      noisyWire.send('ping', { nonce: `active-${i}` })
+    // A burst of live frames used to close the socket. It has to stay open so a reload can finish.
+    for (let i = 0; i < 70; i++) noisyWire.send('ping', { nonce: `active-${i}` })
+    const seen = new Set<string>()
+    while (seen.size < 70) seen.add((await noisyWire.next('pong')).nonce)
+    expect(seen.has('active-0')).toBe(true)
+    expect(seen.has('active-69')).toBe(true)
+    noisyWire.send('ping', { nonce: 'still-open' })
+    expect(await noisyWire.next('pong')).toEqual({ nonce: 'still-open' })
+    expect(noisyWire.ws.readyState).toBe(WebSocket.OPEN)
+  })
+
+  it('delivers a relay burst past the old per-second cap without closing either socket', async () => {
+    const ctx = await connection()
+    await handshake(ctx)
+    // Stay under the 1 MiB frame cap, and together exceed the old 16 MiB/s disconnect.
+    const ciphertext = 'C'.repeat(480 * 1024)
+    const count = 26
+    for (let i = 0; i < count; i++) {
+      ctx.client.send('relay', {
+        connectionId: ctx.connectionId,
+        targetDeviceId: ctx.h.deviceId,
+        counter: i,
+        ciphertext,
+      })
     }
-    expect(await noisyWire.next('error')).toMatchObject({
-      code: 'RATE_LIMITED',
-      retryable: false,
-    })
-    const [closeCode] = await noisyClosed
-    expect(closeCode).toBe(4001)
+    for (let i = 0; i < count; i++) expect((await ctx.host.next('relay')).counter).toBe(i)
+    expect(ctx.client.ws.readyState).toBe(WebSocket.OPEN)
+    expect(ctx.host.ws.readyState).toBe(WebSocket.OPEN)
+    ctx.host.send('ping', { nonce: 'after-burst' })
+    expect(await ctx.host.next('pong')).toEqual({ nonce: 'after-burst' })
+  })
+
+  it('trickles relay frames to a paused reader and keeps both sockets open', async () => {
+    await app.close()
+    await start(password, [], { relayQueueSoftBytes: 16 * 1024, relayQueueHardBytes: 1024 * 1024 })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const ctx = await connection()
+    await handshake(ctx)
+    ctx.host.ws.pause()
+    const count = 40
+    for (let i = 0; i < count; i++) {
+      ctx.client.send('relay', {
+        connectionId: ctx.connectionId,
+        targetDeviceId: ctx.h.deviceId,
+        counter: i,
+        ciphertext: 'D'.repeat(4096),
+      })
+    }
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(ctx.client.ws.readyState).toBe(WebSocket.OPEN)
+    expect(ctx.host.ws.readyState).toBe(WebSocket.OPEN)
+    ctx.host.ws.resume()
+    for (let i = 0; i < count; i++) expect((await ctx.host.next('relay')).counter).toBe(i)
+    ctx.client.send('ping', { nonce: 'sender-alive' })
+    expect(await ctx.client.next('pong')).toEqual({ nonce: 'sender-alive' })
   })
 })
 

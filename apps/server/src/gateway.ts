@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Server } from 'node:http'
+import type { Socket } from 'node:net'
 import { WebSocket, WebSocketServer } from 'ws'
 import {
   createControlFrame,
@@ -25,6 +26,10 @@ export interface GatewayOptions extends GatewayTimingOptions {
   logger?: Logger
   /** Advertise `transport.turn` (and accept TURN credential requests). */
   turnEnabled?: boolean
+  /** Start pausing a fast sender once one peer's queued relay exceeds this. */
+  relayQueueSoftBytes?: number
+  /** Refuse to grow one peer's queued relay past this. The socket stays open. */
+  relayQueueHardBytes?: number
 }
 
 /**
@@ -35,7 +40,32 @@ export interface GatewayOptions extends GatewayTimingOptions {
  */
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
-type Peer = { key: string; accountKey: string; ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string; evictedTombstoneUntil?: number }
+type QueuedFrame = { raw: string; bytes: number }
+type Peer = {
+  key: string
+  accountKey: string
+  ws: WebSocket
+  id: string
+  role: 'host' | 'client'
+  capabilities: string[]
+  version: string
+  lastPong: number
+  /** Advanced when this socket receives a frame or accepts more outbound bytes. */
+  lastProgressAt: number
+  nonce?: string
+  evictedTombstoneUntil?: number
+  urgent: QueuedFrame[]
+  bulk: QueuedFrame[]
+  urgentBytes: number
+  bulkBytes: number
+  pumping: boolean
+  drainArmed: boolean
+  held: boolean
+  heldAt: number
+  pulseBudget: number
+  heldFor?: Peer
+  waiters: Set<Peer>
+}
 type Link = { id: string; accountKey: string; host: string; client: string; hostKey: string; clientKey: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
 type DroppedLink = { accountKey: string; host: string; client: string; hostKey: string; clientKey: string; expiresAt: number; droppedFrames: number }
 
@@ -57,6 +87,24 @@ const MAX_DROPPED_LINKS = 16_384
 export const MAX_ICE_CANDIDATES_PER_CONNECTION = 256
 /** Mirrors docs/protocol.md: Clients use max(server, local) and default to 12 s. */
 const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
+/** Keep the kernel buffer small so a ping is not stuck behind a multi-megabyte relay write. */
+const URGENT_WRITE_WINDOW_BYTES = 256 * 1024
+const BULK_WRITE_WINDOW_BYTES = 64 * 1024
+const DEFAULT_RELAY_QUEUE_SOFT_BYTES = 32 * 1024 * 1024
+const DEFAULT_RELAY_QUEUE_HARD_BYTES = 256 * 1024 * 1024
+const RELAY_PULSE_INTERVAL_MS = 2_000
+const RELAY_PULSE_BYTES = 1024 * 1024
+
+function normalizeQueueBytes(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number.NaN
+  if (!Number.isFinite(parsed) || parsed < 1024) return fallback
+  return Math.min(Math.floor(parsed), 1024 * 1024 * 1024)
+}
+
+function peerSocket(ws: WebSocket): Socket | undefined {
+  const socket = (ws as WebSocket & { _socket?: Socket | null })._socket
+  return socket ?? undefined
+}
 const SUPPORTED_TRANSPORTS = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay'] as const
 const TRANSPORT_NAMES = ['lan', 'p2p', 'turn', 'relay'] as const
 type TransportName = (typeof TRANSPORT_NAMES)[number]
@@ -128,6 +176,12 @@ export class Gateway {
   readonly forceTerminateGraceMs: number
   readonly maxFramesPerSec: number
   readonly logger: Logger
+  private readonly relayQueueSoftBytes: number
+  private readonly relayQueueHardBytes: number
+  private readonly relayQueueGlobalSoftBytes: number
+  private readonly relayQueueGlobalHardBytes: number
+  private queuedBytes = 0
+  private maintainTimer: ReturnType<typeof setInterval>
 
   constructor(server: Server, private store: Store, origin: string, options: GatewayOptions = {}) {
     // One normalization path for CLI and programmatic callers: NaN, Infinity,
@@ -139,6 +193,10 @@ export class Gateway {
     this.heartbeatDisconnectMs = timing.heartbeatDisconnectMs
     this.forceTerminateGraceMs = timing.forceTerminateGraceMs
     this.maxFramesPerSec = normalizeMaxFramesPerSec(options.maxFramesPerSec)
+    this.relayQueueSoftBytes = normalizeQueueBytes(options.relayQueueSoftBytes, DEFAULT_RELAY_QUEUE_SOFT_BYTES)
+    this.relayQueueHardBytes = Math.max(this.relayQueueSoftBytes, normalizeQueueBytes(options.relayQueueHardBytes, DEFAULT_RELAY_QUEUE_HARD_BYTES))
+    this.relayQueueGlobalSoftBytes = Math.min(1024 * 1024 * 1024, this.relayQueueSoftBytes * 8)
+    this.relayQueueGlobalHardBytes = Math.min(1024 * 1024 * 1024, Math.max(this.relayQueueGlobalSoftBytes, this.relayQueueHardBytes * 4))
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
 
@@ -165,12 +223,14 @@ export class Gateway {
         socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
         return
       }
+      const rawSocket = socket as unknown as { setNoDelay?: (noDelay: boolean) => void }
+      rawSocket.setNoDelay?.(true)
       this.wss.handleUpgrade(req, socket, head, ws => this.accept(ws))
     })
     this.heartbeat = setInterval(() => {
       if (this.closed) return
       for (const peer of this.peers.values()) {
-        if (Date.now() - peer.lastPong > this.heartbeatDisconnectMs) {
+        if (this.stale(peer)) {
           this.logger.warn('ws_heartbeat_timeout', {
             peerId: peer.id,
             role: peer.role,
@@ -190,6 +250,15 @@ export class Gateway {
       this.pruneDroppedLinks(Date.now())
     }, this.heartbeatIntervalMs)
     this.heartbeat.unref()
+    this.maintainTimer = setInterval(() => this.maintain(), 1_000)
+    this.maintainTimer.unref()
+  }
+
+  /** A slow reader is still alive while outbound bytes keep moving. An idle silent socket is not. */
+  private stale(peer: Peer): boolean {
+    if (Date.now() - peer.lastPong <= this.heartbeatDisconnectMs) return false
+    const backlog = peer.bulkBytes + peer.urgentBytes + (peer.ws.readyState === WebSocket.OPEN ? peer.ws.bufferedAmount : 0)
+    return !(backlog > 0 && Date.now() - peer.lastProgressAt <= this.heartbeatDisconnectMs)
   }
 
   private pruneDroppedLinks(now: number): void {
@@ -269,10 +338,129 @@ export class Gateway {
     return this.droppedLinks.get(connectionId)?.droppedFrames ?? 0
   }
 
-  private send(peer: Peer, frame: ControlFrame): void {
-    if (peer.ws.readyState !== WebSocket.OPEN) return
-    if (peer.ws.bufferedAmount > 4 * MAX_RELAY_FRAME_BYTES) { this.disconnect(peer.key, 'SLOW_CONSUMER'); return }
-    peer.ws.send(JSON.stringify(frame))
+  private send(peer: Peer, frame: ControlFrame, source?: Peer): void {
+    if (this.peers.get(peer.key) !== peer || peer.ws.readyState !== WebSocket.OPEN) return
+    const raw = JSON.stringify(frame)
+    const item = { raw, bytes: Buffer.byteLength(raw) }
+    // Relay is the bulk path. Everything else (heartbeat, signaling, handshake,
+    // errors) stays ahead of it so a large transfer cannot hide a ping.
+    if (frame.type === 'relay') {
+      peer.bulk.push(item)
+      peer.bulkBytes += item.bytes
+    } else {
+      peer.urgent.push(item)
+      peer.urgentBytes += item.bytes
+    }
+    this.queuedBytes += item.bytes
+    this.pump(peer)
+    if (source && frame.type === 'relay') this.noteCongestion(peer, source, item.bytes)
+  }
+
+  private pump(peer: Peer): void {
+    if (peer.pumping || this.peers.get(peer.key) !== peer || peer.ws.readyState !== WebSocket.OPEN) return
+    const urgent = peer.urgent.length > 0
+    const queue = urgent ? peer.urgent : peer.bulk
+    if (queue.length === 0) return
+    if (peer.ws.bufferedAmount > (urgent ? URGENT_WRITE_WINDOW_BYTES : BULK_WRITE_WINDOW_BYTES) && this.armDrain(peer)) return
+    const item = queue.shift()
+    if (!item) return
+    if (urgent) peer.urgentBytes -= item.bytes
+    else peer.bulkBytes -= item.bytes
+    this.queuedBytes = Math.max(0, this.queuedBytes - item.bytes)
+    peer.pumping = true
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      peer.pumping = false
+      if (this.peers.get(peer.key) !== peer) return
+      peer.lastProgressAt = Date.now()
+      this.releaseWaiters(peer)
+      this.pump(peer)
+    }
+    try {
+      peer.ws.send(item.raw, () => finish())
+    } catch {
+      peer.pumping = false
+    }
+  }
+
+  private armDrain(peer: Peer): boolean {
+    if (peer.drainArmed) return true
+    const socket = peerSocket(peer.ws)
+    if (!socket) return false
+    peer.drainArmed = true
+    const onDrain = () => {
+      socket.off('drain', onDrain)
+      peer.drainArmed = false
+      peer.lastProgressAt = Date.now()
+      this.pump(peer)
+    }
+    socket.on('drain', onDrain)
+    return true
+  }
+
+  private noteCongestion(destination: Peer, source: Peer, bytes: number): void {
+    if (source.pulseBudget > 0) source.pulseBudget = Math.max(0, source.pulseBudget - bytes)
+    const overHard = destination.bulkBytes > this.relayQueueHardBytes || this.queuedBytes > this.relayQueueGlobalHardBytes
+    const overSoft = destination.bulkBytes > this.relayQueueSoftBytes || this.queuedBytes > this.relayQueueGlobalSoftBytes
+    if (source.pulseBudget > 0 && !overHard) return
+    if (!overSoft && !overHard) return
+    if (source.held) return
+    source.held = true
+    source.heldAt = Date.now()
+    source.heldFor = destination
+    destination.waiters.add(source)
+    if (source.ws.readyState === WebSocket.OPEN) source.ws.pause()
+  }
+
+  private releaseWaiters(destination: Peer): void {
+    if (destination.bulkBytes > this.relayQueueSoftBytes / 2) return
+    if (this.queuedBytes > this.relayQueueGlobalSoftBytes / 2) return
+    for (const source of destination.waiters) {
+      source.held = false
+      source.pulseBudget = 0
+      source.heldFor = undefined
+      if (source.ws.readyState === WebSocket.OPEN) source.ws.resume()
+    }
+    destination.waiters.clear()
+  }
+
+  /** Let a paused sender move a little data so its own 10s write timeout does not fire. */
+  private maintain(): void {
+    if (this.closed) return
+    const now = Date.now()
+    for (const peer of this.peers.values()) {
+      if ((peer.urgent.length > 0 || peer.bulk.length > 0) && !peer.pumping) this.pump(peer)
+      if (!peer.held || !peer.heldFor) continue
+      if (peer.heldFor.bulkBytes > this.relayQueueHardBytes || this.queuedBytes > this.relayQueueGlobalHardBytes) continue
+      if (now - peer.heldAt < RELAY_PULSE_INTERVAL_MS) continue
+      peer.pulseBudget = RELAY_PULSE_BYTES
+      peer.held = false
+      peer.heldAt = now
+      if (peer.ws.readyState === WebSocket.OPEN) peer.ws.resume()
+    }
+  }
+
+  private discardOutbound(peer: Peer): void {
+    this.queuedBytes = Math.max(0, this.queuedBytes - peer.bulkBytes - peer.urgentBytes)
+    peer.bulk = []
+    peer.urgent = []
+    peer.bulkBytes = 0
+    peer.urgentBytes = 0
+    for (const source of peer.waiters) {
+      source.held = false
+      source.pulseBudget = 0
+      source.heldFor = undefined
+      if (source.ws.readyState === WebSocket.OPEN) source.ws.resume()
+    }
+    peer.waiters.clear()
+    for (const other of this.peers.values()) {
+      if (!other.waiters.delete(peer)) continue
+      peer.held = false
+      peer.pulseBudget = 0
+      peer.heldFor = undefined
+    }
   }
   private drop(link: Link, code: string): void {
     this.links.delete(link.id)
@@ -285,6 +473,7 @@ export class Gateway {
   disconnect(key: string, code: string): void {
     const peer = this.peers.get(key)
     this.peers.delete(key)
+    if (peer) this.discardOutbound(peer)
     for (const link of this.links.values()) if (link.hostKey === key || link.clientKey === key) this.drop(link, code)
     if (!peer) return
     this.logger.info('ws_peer_disconnected', { peerId: peer.id, code })
@@ -448,7 +637,13 @@ export class Gateway {
           // Keep the negotiated set (what hello.ack advertises), so a link can
           // never coordinate a transport this Server did not offer — e.g. TURN
           // while no TURN deployment is configured.
-          peer = { key, accountKey: authenticated.accountKey, ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
+          const now = Date.now()
+          peer = {
+            key, accountKey: authenticated.accountKey, ws, id: device.deviceId, role: device.role,
+            capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion,
+            lastPong: now, lastProgressAt: now, urgent: [], bulk: [], urgentBytes: 0, bulkBytes: 0,
+            pumping: false, drainArmed: false, held: false, heldAt: 0, pulseBudget: 0, waiters: new Set(),
+          }
           this.peers.set(peer.key, peer)
           this.store.touch(peer.accountKey, peer.id, p.clientVersion, p.harnessVersion)
           this.logger.info('ws_hello_authenticated', {
@@ -479,9 +674,10 @@ export class Gateway {
           }
           return
         }
-        if (++frames > this.maxFramesPerSec || (bytes += frameBytes) > 16 * MAX_RELAY_FRAME_BYTES) {
-          throw new ApiError('RATE_LIMITED')
-        }
+        // Authenticated session traffic is queued, not rejected. The previous
+        // per-second cap closed the socket once a reload exceeded it, and both
+        // directions then had nothing left to load.
+        peer.lastProgressAt = Date.now()
         this.handle(peer, frame)
       } catch (error) {
         const code = error instanceof ApiError ? error.code : 'INVALID_MESSAGE'
@@ -523,7 +719,7 @@ export class Gateway {
       const request = frame.payload as ConnectRequestPayload
       if (peer.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED')
       const candidateHost = this.find(peer.accountKey, request.hostDeviceId)
-      if (candidateHost && Date.now() - candidateHost.lastPong > this.heartbeatDisconnectMs) {
+      if (candidateHost && this.stale(candidateHost)) {
         this.logger.warn('ws_heartbeat_timeout', {
           peerId: candidateHost.id,
           role: candidateHost.role,
@@ -585,7 +781,7 @@ export class Gateway {
         this.recordDroppedLink(link)
       }
       else link.stage = 'accepted'
-      this.send(other, frame)
+      this.send(other, frame, peer)
       return
     }
     if (p.targetDeviceId !== otherId || link.stage === 'pending') throw new ApiError('CONNECTION_NOT_FOUND')
@@ -607,7 +803,7 @@ export class Gateway {
       if (link.stage !== 'ready' || counter <= (link.counters.get(peer.id) ?? -1)) throw new ApiError('INVALID_MESSAGE')
       link.counters.set(peer.id, counter)
     } else throw new ApiError('INVALID_MESSAGE')
-    this.send(other, frame)
+    this.send(other, frame, peer)
   }
   /**
    * Forward WebRTC signaling only while the logical connection is being
@@ -629,7 +825,7 @@ export class Gateway {
     } else {
       throw new ApiError('INVALID_MESSAGE')
     }
-    this.send(other, frame)
+    this.send(other, frame, peer)
   }
   /**
    * Forward the initiator's transport choice, gated on the transports the
@@ -656,12 +852,13 @@ export class Gateway {
     if (selected === 'relay' && !modernHost(other.version)) return
     this.send(other, selected === transport
       ? createControlFrame('transport.selected', { ...payload })
-      : createControlFrame('transport.selected', { ...payload, transport: selected }))
+      : createControlFrame('transport.selected', { ...payload, transport: selected }), peer)
   }
   close(): void {
     if (this.closed) return
     this.closed = true
     clearInterval(this.heartbeat)
+    clearInterval(this.maintainTimer)
     this.logger.info('ws_gateway_closing', { clientCount: this.wss.clients.size })
     for (const ws of this.wss.clients) {
       // Give resumable clients an explicit, unambiguous shutdown signal. A

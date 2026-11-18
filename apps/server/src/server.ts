@@ -37,6 +37,10 @@ export interface Config {
   heartbeatDisconnectMs?: number
   forceTerminateGraceMs?: number
   maxFramesPerSec?: number
+  /** Bytes of queued relay to one peer before the sender is paused. */
+  relayQueueSoftBytes?: number
+  /** Bytes of queued relay to one peer that a sender pulse will not pass. */
+  relayQueueHardBytes?: number
   logLevel?: LogLevel
   ice?: IceConfig
 }
@@ -238,6 +242,8 @@ export function createRemoteServer(config: Config) {
   const gateway = new Gateway(server, store, url.origin, {
     ...timing,
     maxFramesPerSec: normalizeMaxFramesPerSec(config.maxFramesPerSec),
+    relayQueueSoftBytes: config.relayQueueSoftBytes,
+    relayQueueHardBytes: config.relayQueueHardBytes,
     logLevel: config.logLevel,
     logger: logger.child('gateway'),
     turnEnabled: ice.turnUrls.length > 0,
