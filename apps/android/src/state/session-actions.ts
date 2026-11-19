@@ -413,8 +413,12 @@ export function createSessionActions({ get, set, runtime }: SessionAccess): Pick
         const resume = preservedMessages !== undefined && preservedMessages.length > 0
           ? getFollowResume(memoryScope, session.sessionId)
           : undefined
+        const parentSessionId = isSubagentSession(session) ? session.parentSessionId : undefined
+        const historyRequest = resume === undefined
+          ? runtime.connection.requireProxy().sessionHistory(session.sessionId, undefined, 16, parentSessionId)
+          : runtime.connection.requireProxy().sessionHistory(session.sessionId, undefined, 16, parentSessionId, resume)
         const [history, feedback] = await Promise.all([
-          runtime.connection.requireProxy().sessionHistory(session.sessionId, undefined, 16, isSubagentSession(session) ? session.parentSessionId : undefined, resume),
+          historyRequest,
           // Older carriers may not expose feedback; history must remain usable.
           runtime.connection.requireProxy().messageFeedbackList(session.sessionId).catch(() => undefined),
         ])
