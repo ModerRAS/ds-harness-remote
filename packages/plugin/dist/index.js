@@ -64619,6 +64619,262 @@ function parseWireJson(input4) {
   }
 }
 
+// packages/protocol/dist/sha256.js
+var K = new Uint32Array([
+  1116352408,
+  1899447441,
+  3049323471,
+  3921009573,
+  961987163,
+  1508970993,
+  2453635748,
+  2870763221,
+  3624381080,
+  310598401,
+  607225278,
+  1426881987,
+  1925078388,
+  2162078206,
+  2614888103,
+  3248222580,
+  3835390401,
+  4022224774,
+  264347078,
+  604807628,
+  770255983,
+  1249150122,
+  1555081692,
+  1996064986,
+  2554220882,
+  2821834349,
+  2952996808,
+  3210313671,
+  3336571891,
+  3584528711,
+  113926993,
+  338241895,
+  666307205,
+  773529912,
+  1294757372,
+  1396182291,
+  1695183700,
+  1986661051,
+  2177026350,
+  2456956037,
+  2730485921,
+  2820302411,
+  3259730800,
+  3345764771,
+  3516065817,
+  3600352804,
+  4094571909,
+  275423344,
+  430227734,
+  506948616,
+  659060556,
+  883997877,
+  958139571,
+  1322822218,
+  1537002063,
+  1747873779,
+  1955562222,
+  2024104815,
+  2227730452,
+  2361852424,
+  2428436474,
+  2756734187,
+  3204031479,
+  3329325298
+]);
+function rotr(x, n) {
+  return x >>> n | x << 32 - n;
+}
+function sha256(data2) {
+  const bitLen3 = data2.length * 8;
+  const zeroCount = (64 + 56 - (data2.length + 1) % 64) % 64;
+  const bytes = new Uint8Array(data2.length + 1 + zeroCount + 8);
+  bytes.set(data2);
+  bytes[data2.length] = 128;
+  const view = new DataView(bytes.buffer);
+  view.setUint32(bytes.length - 8, Math.floor(bitLen3 / 4294967296));
+  view.setUint32(bytes.length - 4, bitLen3 >>> 0);
+  let h0 = 1779033703;
+  let h1 = 3144134277;
+  let h2 = 1013904242;
+  let h3 = 2773480762;
+  let h4 = 1359893119;
+  let h5 = 2600822924;
+  let h6 = 528734635;
+  let h7 = 1541459225;
+  const w = new Uint32Array(64);
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    for (let index = 0; index < 16; index += 1)
+      w[index] = view.getUint32(offset + index * 4);
+    for (let index = 16; index < 64; index += 1) {
+      const s0 = rotr(w[index - 15], 7) ^ rotr(w[index - 15], 18) ^ w[index - 15] >>> 3;
+      const s1 = rotr(w[index - 2], 17) ^ rotr(w[index - 2], 19) ^ w[index - 2] >>> 10;
+      w[index] = w[index - 16] + s0 + w[index - 7] + s1 >>> 0;
+    }
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    let f = h5;
+    let g = h6;
+    let h = h7;
+    for (let index = 0; index < 64; index += 1) {
+      const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = e & f ^ ~e & g;
+      const temp1 = h + s1 + ch + K[index] + w[index] >>> 0;
+      const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = a & b ^ a & c ^ b & c;
+      const temp2 = s0 + maj >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temp1 >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = temp1 + temp2 >>> 0;
+    }
+    h0 = h0 + a >>> 0;
+    h1 = h1 + b >>> 0;
+    h2 = h2 + c >>> 0;
+    h3 = h3 + d >>> 0;
+    h4 = h4 + e >>> 0;
+    h5 = h5 + f >>> 0;
+    h6 = h6 + g >>> 0;
+    h7 = h7 + h >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const hashed = new DataView(out.buffer);
+  hashed.setUint32(0, h0);
+  hashed.setUint32(4, h1);
+  hashed.setUint32(8, h2);
+  hashed.setUint32(12, h3);
+  hashed.setUint32(16, h4);
+  hashed.setUint32(20, h5);
+  hashed.setUint32(24, h6);
+  hashed.setUint32(28, h7);
+  return out;
+}
+function sha256Hex(data2) {
+  return [...sha256(data2)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// packages/protocol/dist/relay2.js
+var MAX_RELAY2_CIPHERTEXT_BYTES = 1024 * 1024;
+var RELAY2_CAPABILITY = "transport.relay2";
+var ATTACH = 1;
+var READY = 2;
+var DATA = 3;
+var textEncoder = new TextEncoder();
+var textDecoder = new TextDecoder();
+function encodeRelay2Attach(attach) {
+  const body = textEncoder.encode(JSON.stringify({
+    ticket: attach.ticket,
+    connectionId: attach.connectionId,
+    deviceId: attach.deviceId
+  }));
+  if (body.byteLength > 4096)
+    throw new Error("Relay2 attach is too large.");
+  const frame = new Uint8Array(1 + body.byteLength);
+  frame[0] = ATTACH;
+  frame.set(body, 1);
+  return frame;
+}
+function encodeRelay2Data(counter, ciphertext) {
+  if (!Number.isSafeInteger(counter) || counter < 0 || counter > 4294967295) {
+    throw new Error("Relay2 counter is out of range.");
+  }
+  if (ciphertext.byteLength > MAX_RELAY2_CIPHERTEXT_BYTES)
+    throw new Error("Relay2 frame is too large.");
+  const frame = new Uint8Array(5 + ciphertext.byteLength);
+  frame[0] = DATA;
+  new DataView(frame.buffer).setUint32(1, counter);
+  frame.set(ciphertext, 5);
+  return frame;
+}
+function decodeRelay2Frame(data2) {
+  if (data2.byteLength < 1)
+    throw new Error("Relay2 frame is empty.");
+  const type = data2[0];
+  if (type === READY) {
+    if (data2.byteLength !== 1)
+      throw new Error("Relay2 ready frame is malformed.");
+    return { type: "ready" };
+  }
+  if (type === ATTACH) {
+    let parsed;
+    try {
+      parsed = JSON.parse(textDecoder.decode(data2.subarray(1)));
+    } catch {
+      throw new Error("Relay2 attach is malformed.");
+    }
+    if (typeof parsed !== "object" || parsed === null)
+      throw new Error("Relay2 attach is malformed.");
+    const record11 = parsed;
+    if (typeof record11.ticket !== "string" || record11.ticket.length < 16 || record11.ticket.length > 128) {
+      throw new Error("Relay2 attach ticket is malformed.");
+    }
+    if (typeof record11.connectionId !== "string" || record11.connectionId.length < 1 || record11.connectionId.length > 128) {
+      throw new Error("Relay2 attach connection is malformed.");
+    }
+    if (typeof record11.deviceId !== "string" || record11.deviceId.length < 1 || record11.deviceId.length > 128) {
+      throw new Error("Relay2 attach device is malformed.");
+    }
+    return { type: "attach", ticket: record11.ticket, connectionId: record11.connectionId, deviceId: record11.deviceId };
+  }
+  if (type === DATA) {
+    if (data2.byteLength < 5 || data2.byteLength > MAX_RELAY2_CIPHERTEXT_BYTES + 5)
+      throw new Error("Relay2 data frame is malformed.");
+    return {
+      type: "data",
+      counter: new DataView(data2.buffer, data2.byteOffset, data2.byteLength).getUint32(1),
+      ciphertext: data2.subarray(5)
+    };
+  }
+  throw new Error("Relay2 frame type is unknown.");
+}
+function stableStringify(value) {
+  if (value === void 0)
+    return "null";
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value))
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  const record11 = value;
+  const keys = Object.keys(record11).filter((key) => record11[key] !== void 0).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record11[key])}`).join(",")}}`;
+}
+function followSnapshotHash(snapshot2) {
+  return sha256Hex(textEncoder.encode(stableStringify({
+    records: snapshot2.records ?? null,
+    header: snapshot2.header ?? null
+  })));
+}
+function resumeFollowSnapshot(snapshot2, resume) {
+  if (snapshot2.type !== "snapshot" || resume === void 0)
+    return snapshot2;
+  if (!Number.isSafeInteger(resume.cursor) || resume.cursor < 0)
+    return snapshot2;
+  if (!/^[a-f0-9]{64}$/.test(resume.hash))
+    return snapshot2;
+  if (followSnapshotHash(snapshot2) !== resume.hash)
+    return snapshot2;
+  return {
+    type: "snapshot",
+    unchanged: true,
+    cursor: snapshot2.cursor,
+    hasMore: snapshot2.hasMore === true,
+    ...snapshot2.projections === void 0 ? {} : { projections: snapshot2.projections },
+    ...snapshot2.header === void 0 ? {} : { header: snapshot2.header },
+    ...snapshot2.assistantStream === void 0 ? {} : { assistantStream: snapshot2.assistantStream }
+  };
+}
+
 // packages/protocol/dist/close-semantics.js
 var SERVER_SHUTDOWN_REASON = "server shutdown";
 var SERVER_SHUTDOWN_CLOSE_CODES = [4009, 4001, 1013];
@@ -65025,7 +65281,16 @@ var connectIncomingPayloadSchema = external_exports.object({
   relayEndpoint: external_exports.string().url().optional(),
   relayTicket: external_exports.string().min(1).optional(),
   relayNodeId: external_exports.string().min(1).optional(),
-  relayEpoch: external_exports.number().int().nonnegative().optional()
+  relayEpoch: external_exports.number().int().nonnegative().optional(),
+  relay2Endpoint: external_exports.string().min(8).max(2048).refine((value) => {
+    try {
+      const url2 = new URL(value);
+      return (url2.protocol === "ws:" || url2.protocol === "wss:") && url2.pathname === "/ws/v1/relay2";
+    } catch {
+      return false;
+    }
+  }).optional(),
+  relay2Ticket: external_exports.string().min(16).max(128).optional()
 });
 var connectAcceptedPayloadSchema = external_exports.object({
   relayRecoveryTicket: external_exports.string().min(1).max(4096).optional(),
@@ -65034,7 +65299,16 @@ var connectAcceptedPayloadSchema = external_exports.object({
   relayEndpoint: external_exports.string().url().optional(),
   relayTicket: external_exports.string().min(1).optional(),
   relayNodeId: external_exports.string().min(1).optional(),
-  relayEpoch: external_exports.number().int().nonnegative().optional()
+  relayEpoch: external_exports.number().int().nonnegative().optional(),
+  relay2Endpoint: external_exports.string().min(8).max(2048).refine((value) => {
+    try {
+      const url2 = new URL(value);
+      return (url2.protocol === "ws:" || url2.protocol === "wss:") && url2.pathname === "/ws/v1/relay2";
+    } catch {
+      return false;
+    }
+  }).optional(),
+  relay2Ticket: external_exports.string().min(16).max(128).optional()
 });
 var connectRejectedPayloadSchema = external_exports.object({
   connectionId: external_exports.string().min(1),
@@ -68955,6 +69229,15 @@ async function waitForRelayCapacity(socket) {
   if (socket.readyState !== 1)
     throw new Error("Relay transport closed");
 }
+async function waitForRelay2Capacity(socket) {
+  while ((socket.bufferedAmount ?? 0) > 1024 * 1024) {
+    if (socket.readyState !== 1)
+      throw new Error("Relay transport closed");
+    await new Promise((resolve10) => setTimeout(resolve10, 10));
+  }
+  if (socket.readyState !== 1)
+    throw new Error("Relay transport closed");
+}
 
 // packages/webrtc/dist/transport.js
 var BaseTransport = class {
@@ -70139,7 +70422,7 @@ var ControlLease = class {
 };
 
 // packages/webrtc/dist/adaptive-transport.js
-var DEFAULT_CAPABILITIES = [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, "transport.lan", "transport.p2p", "transport.turn", "transport.relay", "transport.relay.attach", "harness.api.v1"];
+var DEFAULT_CAPABILITIES = [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, "transport.lan", "transport.p2p", "transport.turn", "transport.relay", "transport.relay.attach", RELAY2_CAPABILITY, "harness.api.v1"];
 var DEFAULT_PREFERRED_TRANSPORTS = ["lan", "p2p", "turn", "relay"];
 var AdaptiveTransport = class extends BaseTransport {
   url;
@@ -70169,6 +70452,9 @@ var AdaptiveTransport = class extends BaseTransport {
   lastControlSentAt;
   lastRtcDiagnostics;
   relayAssignment;
+  relay2Assignment;
+  relay2Socket;
+  relay2Ready = false;
   dataReady = false;
   recoveryTicket;
   relayRecoveryTicket;
@@ -70244,6 +70530,13 @@ var AdaptiveTransport = class extends BaseTransport {
       return;
     }
     const socket = this.dataSocket ?? this.socket;
+    if (this.relay2Ready && this.relay2Socket?.readyState === WebSocket.OPEN) {
+      await waitForRelay2Capacity(this.relay2Socket);
+      this.relay2Socket.send(encodeRelay2Data(this.relayCounter, data2));
+      this.bytesSent += data2.byteLength;
+      this.relayCounter += 1;
+      return;
+    }
     if (socket?.readyState !== WebSocket.OPEN)
       throw new Error("adaptive transport is not connected");
     await waitForRelayCapacity(socket);
@@ -70375,6 +70668,9 @@ var AdaptiveTransport = class extends BaseTransport {
         if (typeof assignment.relayEndpoint === "string" && typeof assignment.relayTicket === "string") {
           this.relayAssignment = assignment;
         }
+        if (typeof payload.relay2Endpoint === "string" && typeof payload.relay2Ticket === "string") {
+          this.relay2Assignment = { endpoint: payload.relay2Endpoint, ticket: payload.relay2Ticket };
+        }
         this.clearHandshake();
         void this.negotiate(lifetime.signal).catch((error62) => {
           if (this.lifetime === lifetime)
@@ -70400,7 +70696,7 @@ var AdaptiveTransport = class extends BaseTransport {
         return;
       }
       if (frame.type === "relay") {
-        if (this.dataSocket !== void 0)
+        if (this.dataSocket !== void 0 || this.relay2Ready)
           return;
         if (this.dataMode !== "relay")
           return;
@@ -70498,7 +70794,16 @@ var AdaptiveTransport = class extends BaseTransport {
       selected = "relay";
     }
     this.selected = selected;
-    if (selected === "relay" && this.relayAssignment !== void 0) {
+    if (selected === "relay" && this.relay2Assignment !== void 0) {
+      try {
+        await this.openRelay2(this.relay2Assignment);
+      } catch {
+        this.relay2Socket?.close();
+        this.relay2Socket = void 0;
+        this.relay2Ready = false;
+      }
+    }
+    if (selected === "relay" && !this.relay2Ready && this.relayAssignment !== void 0) {
       await this.openDataSocket(this.relayAssignment);
     }
     const turnNode = selected === "turn" ? this.rtc?.selectedRelayUrl() : void 0;
@@ -70724,6 +71029,60 @@ var AdaptiveTransport = class extends BaseTransport {
       });
     }
   }
+  async openRelay2(assignment) {
+    if (this.connectionId === void 0 || this.relay2Socket !== void 0)
+      return;
+    const connectionId = this.connectionId;
+    const socket = new WebSocket(assignment.endpoint);
+    socket.binaryType = "arraybuffer";
+    this.relay2Socket = socket;
+    await new Promise((resolve10, reject) => {
+      let settled = false;
+      const timer2 = setTimeout(() => finish(new Error("Relay2 attach timed out")), 15e3);
+      const finish = (error62) => {
+        if (settled)
+          return;
+        settled = true;
+        clearTimeout(timer2);
+        if (error62 === void 0)
+          resolve10();
+        else
+          reject(error62);
+      };
+      socket.onopen = () => {
+        socket.send(encodeRelay2Attach({
+          ticket: assignment.ticket,
+          connectionId,
+          deviceId: this.options.deviceId
+        }));
+      };
+      socket.onmessage = (event) => {
+        void relay2Bytes(event.data).then((bytes) => {
+          const frame = decodeRelay2Frame(bytes);
+          if (frame.type === "ready") {
+            this.relay2Ready = true;
+            finish();
+            return;
+          }
+          if (frame.type !== "data" || !this.relay2Ready)
+            return;
+          this.bytesReceived += frame.ciphertext.byteLength;
+          this.emit(frame.ciphertext);
+        }).catch((error62) => {
+          const failure5 = error62 instanceof Error ? error62 : new Error("Relay2 frame failed");
+          finish(failure5);
+          this.failConnection(failure5);
+        });
+      };
+      socket.onerror = () => finish(new Error("Relay2 socket failed"));
+      socket.onclose = () => {
+        if (!this.relay2Ready)
+          finish(new Error("Relay2 socket closed before ready"));
+        else
+          this.failConnection(new Error("Relay2 socket closed"));
+      };
+    });
+  }
   async openDataSocket(assignment) {
     if (this.connectionId === void 0 || this.dataSocket !== void 0)
       return;
@@ -70849,17 +71208,22 @@ var AdaptiveTransport = class extends BaseTransport {
     const rtc = this.rtc;
     const socket = this.socket;
     const dataSocket = this.dataSocket;
+    const relay2Socket = this.relay2Socket;
     this.rtc = void 0;
     this.socket = void 0;
     this.dataSocket = void 0;
+    this.relay2Socket = void 0;
     this.dataReady = false;
+    this.relay2Ready = false;
     this.relayAssignment = void 0;
+    this.relay2Assignment = void 0;
     this.connectionId = void 0;
     this.connectedAt = void 0;
     lifetime?.abort();
     reject?.(error62);
     void rtc?.close();
     dataSocket?.close();
+    relay2Socket?.close();
     socket?.close();
     if (established && diagnostic !== void 0) {
       try {
@@ -70918,6 +71282,17 @@ var SERVER_NEGOTIATE_TIMEOUT_MAX_MS = 12e3;
 function throwIfAborted(signal) {
   if (signal?.aborted)
     throw new Error("Adaptive connection was aborted");
+}
+async function relay2Bytes(data2) {
+  if (data2 instanceof Uint8Array)
+    return data2;
+  if (data2 instanceof ArrayBuffer)
+    return new Uint8Array(data2);
+  if (ArrayBuffer.isView(data2))
+    return new Uint8Array(data2.buffer, data2.byteOffset, data2.byteLength);
+  if (typeof Blob !== "undefined" && data2 instanceof Blob)
+    return new Uint8Array(await data2.arrayBuffer());
+  throw new Error("Relay2 frame must be binary.");
 }
 
 // packages/webrtc/dist/serial-send.js
@@ -74016,7 +74391,7 @@ function clean2(...arrays) {
 function createView2(arr) {
   return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
 }
-function rotr2(word, shift) {
+function rotr3(word, shift) {
   return word << 32 - shift | word >>> shift;
 }
 var isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([287454020]).buffer)[0] === 68)();
@@ -74375,15 +74750,15 @@ var SHA2_32B = class extends HashMD2 {
     for (let i = 16; i < 64; i++) {
       const W15 = SHA256_W[i - 15];
       const W2 = SHA256_W[i - 2];
-      const s0 = rotr2(W15, 7) ^ rotr2(W15, 18) ^ W15 >>> 3;
-      const s1 = rotr2(W2, 17) ^ rotr2(W2, 19) ^ W2 >>> 10;
+      const s0 = rotr3(W15, 7) ^ rotr3(W15, 18) ^ W15 >>> 3;
+      const s1 = rotr3(W2, 17) ^ rotr3(W2, 19) ^ W2 >>> 10;
       SHA256_W[i] = s1 + SHA256_W[i - 7] + s0 + SHA256_W[i - 16] | 0;
     }
     let { A, B, C, D, E, F, G, H } = this;
     for (let i = 0; i < 64; i++) {
-      const sigma1 = rotr2(E, 6) ^ rotr2(E, 11) ^ rotr2(E, 25);
+      const sigma1 = rotr3(E, 6) ^ rotr3(E, 11) ^ rotr3(E, 25);
       const T1 = H + sigma1 + Chi2(E, F, G) + SHA256_K[i] + SHA256_W[i] | 0;
-      const sigma0 = rotr2(A, 2) ^ rotr2(A, 13) ^ rotr2(A, 22);
+      const sigma0 = rotr3(A, 2) ^ rotr3(A, 13) ^ rotr3(A, 22);
       const T2 = sigma0 + Maj2(A, B, C) | 0;
       H = G;
       G = F;
@@ -74646,7 +75021,7 @@ var _SHA512 = class extends SHA2_64B {
     super(64, SHA512_IV2);
   }
 };
-var sha256 = /* @__PURE__ */ createHasher2(
+var sha2562 = /* @__PURE__ */ createHasher2(
   () => new _SHA256(),
   /* @__PURE__ */ oidNist(1)
 );
@@ -76771,16 +77146,16 @@ var BSIGMA = /* @__PURE__ */ Uint8Array.from([
 ]);
 function G1s(a, b, c, d, x) {
   a = a + b + x | 0;
-  d = rotr2(d ^ a, 16);
+  d = rotr3(d ^ a, 16);
   c = c + d | 0;
-  b = rotr2(b ^ c, 12);
+  b = rotr3(b ^ c, 12);
   return { a, b, c, d };
 }
 function G2s(a, b, c, d, x) {
   a = a + b + x | 0;
-  d = rotr2(d ^ a, 8);
+  d = rotr3(d ^ a, 8);
   c = c + d | 0;
-  b = rotr2(b ^ c, 7);
+  b = rotr3(b ^ c, 7);
   return { a, b, c, d };
 }
 
@@ -77324,7 +77699,7 @@ function makeHash(name2, hash3, hashLen, blockLen) {
     }
   };
 }
-var sha256H = makeHash("SHA256", sha256, 32, 64);
+var sha256H = makeHash("SHA256", sha2562, 32, 64);
 var sha512H = makeHash("SHA512", sha5122, 64, 128);
 var blake2bH = makeHash("BLAKE2b", blake2b, 64, 128);
 var blake2sH = makeHash("BLAKE2s", blake2s, 32, 64);
@@ -100534,7 +100909,7 @@ var HostServerConnection = class {
   async connectOnce() {
     const credentials = await this.api.authenticate(this.identity);
     if (this.stopped) return;
-    const offeredCapabilities = this.rtcFactoryProvider === void 0 || this.config.forceRelay ? [RELAY_RESUME_CAPABILITY, "transport.relay", "transport.relay.attach", ...this.hostCapabilities()] : [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, "transport.lan", "transport.p2p", "transport.turn", "transport.relay", "transport.relay.attach", ...this.hostCapabilities()];
+    const offeredCapabilities = this.rtcFactoryProvider === void 0 || this.config.forceRelay ? [RELAY_RESUME_CAPABILITY, "transport.relay", "transport.relay.attach", RELAY2_CAPABILITY, ...this.hostCapabilities()] : [WEBRTC_RESUME_CAPABILITY, RELAY_RESUME_CAPABILITY, "transport.lan", "transport.p2p", "transport.turn", "transport.relay", "transport.relay.attach", RELAY2_CAPABILITY, ...this.hostCapabilities()];
     const recoveryTickets = [...this.tunnels.values()].flatMap((tunnel) => tunnel.lease?.recoveryTicket() ?? []).slice(0, 64);
     const socket = this.createWebSocket(websocketUrl2(this.api.baseUrl));
     this.socket = socket;
@@ -100835,7 +101210,8 @@ var HostServerConnection = class {
     }
     if (frame.type === "relay") {
       const payload = requireRelay(frame.payload);
-      if (this.tunnels.get(payload.connectionId)?.dataSocket !== void 0) return;
+      const tunnel = this.tunnels.get(payload.connectionId);
+      if (tunnel?.dataSocket !== void 0 || tunnel?.relay2Ready === true) return;
       await this.handleRelay(payload);
       return;
     }
@@ -100961,7 +101337,8 @@ var HostServerConnection = class {
       preferredTransports: payload.preferredTransports,
       noise,
       transport: "negotiating",
-      ...typeof payload.relayEndpoint === "string" && typeof payload.relayTicket === "string" ? { relayAssignment: payload } : {}
+      ...typeof payload.relayEndpoint === "string" && typeof payload.relayTicket === "string" ? { relayAssignment: payload } : {},
+      ...typeof payload.relay2Endpoint === "string" && typeof payload.relay2Ticket === "string" ? { relay2Assignment: { endpoint: payload.relay2Endpoint, ticket: payload.relay2Ticket } } : {}
     };
     this.tunnels.set(payload.connectionId, tunnel);
     this.sendControl("connect.accepted", { connectionId: payload.connectionId });
@@ -101010,8 +101387,11 @@ var HostServerConnection = class {
         });
       }
       tunnel.dataSocket?.close();
+      tunnel.relay2Socket?.close();
       tunnel.dataSocket = void 0;
+      tunnel.relay2Socket = void 0;
       tunnel.dataReady = false;
+      tunnel.relay2Ready = false;
     }, mode2);
     tunnel.channel = channel;
     await this.connections.accept(channel);
@@ -101177,7 +101557,21 @@ var HostServerConnection = class {
       tunnel.transport = "relay";
       tunnel.transportMode = void 0;
       await rtc?.close();
-      if (tunnel.relayAssignment !== void 0) {
+      if (tunnel.relay2Assignment !== void 0 && tunnel.relay2Ready !== true) {
+        try {
+          await this.openRelay2(tunnel);
+        } catch (error62) {
+          this.logger.warn("relay2 attach failed; using the JSON relay", {
+            connectionId: shortId3(tunnel.connectionId),
+            peerDeviceId: shortId3(tunnel.peer.deviceId),
+            reason: diagnosticReason3(error62)
+          });
+          tunnel.relay2Socket?.close();
+          tunnel.relay2Socket = void 0;
+          tunnel.relay2Ready = false;
+        }
+      }
+      if (!tunnel.relay2Ready && tunnel.relayAssignment !== void 0) {
         try {
           await this.openDataSocket(tunnel);
         } catch (error62) {
@@ -101317,8 +101711,13 @@ var HostServerConnection = class {
     }
     const counter = Number(tunnel.noise.sendingCounter() - 1n);
     if (!Number.isSafeInteger(counter) || counter < 0) throw new ControlConnectionError("FRAME_TOO_LARGE", "Noise transport counter overflowed.");
-    const socket = tunnel.dataSocket ?? this.socket;
+    const socket = tunnel.relay2Ready ? tunnel.relay2Socket : tunnel.dataSocket ?? this.socket;
     if (socket === void 0) throw new Error("Relay transport closed");
+    if (tunnel.relay2Ready && tunnel.relay2Socket?.readyState === 1) {
+      await waitForRelay2Capacity(tunnel.relay2Socket);
+      tunnel.relay2Socket.send(encodeRelay2Data(counter, ciphertext));
+      return;
+    }
     await waitForRelayCapacity(socket);
     if (this.tunnels.get(tunnel.connectionId) !== tunnel || tunnel.channel === void 0) {
       throw new Error("Relay tunnel closed");
@@ -101341,6 +101740,56 @@ var HostServerConnection = class {
       targetDeviceId: tunnel.peer.deviceId,
       counter,
       ciphertext: toBase64Url2(ciphertext)
+    });
+  }
+  async openRelay2(tunnel) {
+    const assignment = tunnel.relay2Assignment;
+    if (assignment === void 0 || tunnel.relay2Socket !== void 0) return;
+    const socket = this.createWebSocket(assignment.endpoint);
+    socket.binaryType = "arraybuffer";
+    tunnel.relay2Socket = socket;
+    await new Promise((resolve10, reject) => {
+      let settled = false;
+      const timer2 = setTimeout(() => finish(new Error("Relay2 attach timed out")), 15e3);
+      const finish = (error62) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer2);
+        if (error62 === void 0) resolve10();
+        else reject(error62);
+      };
+      socket.onopen = () => {
+        try {
+          socket.send(encodeRelay2Attach({
+            ticket: assignment.ticket,
+            connectionId: tunnel.connectionId,
+            deviceId: this.identity.deviceId
+          }));
+        } catch (error62) {
+          finish(asError2(error62));
+        }
+      };
+      socket.onmessage = (event) => {
+        try {
+          const bytes = relay2Bytes2(event.data);
+          const frame = decodeRelay2Frame(bytes);
+          if (frame.type === "ready") {
+            tunnel.relay2Ready = true;
+            finish();
+            return;
+          }
+          if (frame.type !== "data" || tunnel.relay2Ready !== true || tunnel.channel === void 0) return;
+          tunnel.channel.receive(frame.counter, frame.ciphertext);
+        } catch (error62) {
+          finish(asError2(error62));
+          void this.dropTunnel(tunnel.connectionId, "CONNECTION_FAILED");
+        }
+      };
+      socket.onerror = () => finish(new Error("Relay2 socket failed"));
+      socket.onclose = () => {
+        if (tunnel.relay2Ready !== true) finish(new Error("Relay2 socket closed before ready"));
+        else void this.dropTunnel(tunnel.connectionId, "CONNECTION_FAILED");
+      };
     });
   }
   async openDataSocket(tunnel) {
@@ -101434,6 +101883,7 @@ var HostServerConnection = class {
       tunnel.lease?.stop();
       if (tunnel.rtc !== void 0) await tunnel.rtc.close();
       tunnel.dataSocket?.close();
+      tunnel.relay2Socket?.close();
       if (tunnel.channel !== void 0) await tunnel.channel.close();
       else tunnel.noise.destroy();
     }));
@@ -101454,8 +101904,11 @@ var HostServerConnection = class {
       });
     }
     tunnel.dataSocket?.close();
+    tunnel.relay2Socket?.close();
     tunnel.dataSocket = void 0;
+    tunnel.relay2Socket = void 0;
     tunnel.dataReady = false;
+    tunnel.relay2Ready = false;
     if (tunnel.channel !== void 0) {
       try {
         const closed = detail === void 0 ? await this.connections.closeConnection(connectionId, code) : await this.connections.closeConnection(connectionId, code, detail);
@@ -101657,6 +102110,12 @@ function shortId3(value) {
   return value.length <= 12 ? value : `${value.slice(0, 8)}\u2026${value.slice(-4)}`;
 }
 var TURN_NODE_TEXT = /^[A-Za-z0-9.[\]:-]+$/;
+function relay2Bytes2(data2) {
+  if (data2 instanceof Uint8Array) return data2;
+  if (data2 instanceof ArrayBuffer) return new Uint8Array(data2);
+  if (ArrayBuffer.isView(data2)) return new Uint8Array(data2.buffer, data2.byteOffset, data2.byteLength);
+  throw new ControlConnectionError("INVALID_MESSAGE", "Relay2 frames must be binary.");
+}
 function asError2(error62) {
   return error62 instanceof Error ? error62 : new Error("Unknown Server connection error.");
 }
@@ -102216,11 +102675,13 @@ var HarnessRemoteBridge = class {
     if (this.streams.size >= MAX_ACTIVE_STREAMS3) {
       throw new RpcError("RATE_LIMITED", "Too many Harness Remote streams are open.", void 0, true);
     }
+    const follow = params.endpoint === "session/follow" ? takeFollowResume(params.payload) : void 0;
+    const streamPayload = follow?.payload ?? params.payload;
     const controller = new AbortController();
     this.streams.set(params.streamId, { controller });
     let source;
     try {
-      source = (this.codexWorkspace === void 0 ? void 0 : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal)) ?? await (params.endpoint === "terminal/follow" && this.terminalCarrier !== void 0 ? this.terminalCarrier.open(params.payload, controller.signal) : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, params.payload, this.harnessVersion), controller.signal));
+      source = (this.codexWorkspace === void 0 ? void 0 : await this.codexWorkspace.open(params.endpoint, params.payload, controller.signal)) ?? await (params.endpoint === "terminal/follow" && this.terminalCarrier !== void 0 ? this.terminalCarrier.open(params.payload, controller.signal) : this.gateway.open(params.endpoint, normalizeWorkspaceChangesPayload(params.endpoint, streamPayload, this.harnessVersion), controller.signal));
       controller.signal.throwIfAborted();
     } catch (error62) {
       this.streams.delete(params.streamId);
@@ -102228,7 +102689,7 @@ var HarnessRemoteBridge = class {
       throw error62;
     }
     if (params.endpoint === "$events") source = this.remoteEventsWithFallback(source, controller.signal);
-    void this.pump(params.streamId, source, controller.signal, params.endpoint === "session/follow", params.transferFrames);
+    void this.pump(params.streamId, source, controller.signal, params.endpoint === "session/follow", params.transferFrames, follow?.resume);
     return { opened: true, streamId: params.streamId };
   }
   async *remoteEventsWithFallback(source, signal) {
@@ -102339,16 +102800,18 @@ var HarnessRemoteBridge = class {
       throw new RpcError("FEATURE_NOT_SUPPORTED", "This Harness version does not support Remote event transport.");
     }
   }
-  async pump(streamId, source, signal, historyFollow = false, transferFrames = false) {
+  async pump(streamId, source, signal, historyFollow = false, transferFrames = false, resume) {
     let reason = "completed";
     let failure5;
     try {
       for await (const value of source) {
         if (signal.aborted) break;
+        const sent = historyFollow && this.compactHistoryEnabled && isCompactSnapshot(value) ? compactHistory(value) : value;
+        const resumed = historyFollow && isRecord22(sent) ? resumeFollowSnapshot(sent, resume) : sent;
         const frame = {
           streamId,
           hasValue: true,
-          ...value === void 0 ? {} : { value: historyFollow && this.compactHistoryEnabled && isCompactSnapshot(value) ? compactHistory(value) : value }
+          ...value === void 0 ? {} : { value: resumed }
         };
         if (encodeMessage(createEvent("harness.remote.frame", frame)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
           if (!transferFrames) throw new Error("Oversized Harness Remote frame");
@@ -102952,6 +103415,16 @@ function record10(value) {
 }
 function isRecord22(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function takeFollowResume(payload) {
+  if (!isRecord22(payload) || !isRecord22(payload.args) || !isRecord22(payload.args.request) || !Object.hasOwn(payload.args.request, "resume")) {
+    return { payload };
+  }
+  const request = payload.args.request;
+  const { resume, ...rest } = request;
+  const next = { ...payload, args: { ...payload.args, request: rest } };
+  if (!isRecord22(resume) || typeof resume.hash !== "string" || typeof resume.cursor !== "number") return { payload: next };
+  return { payload: next, resume: { hash: resume.hash, cursor: resume.cursor } };
 }
 function isCompactSnapshot(value) {
   return value !== null && typeof value === "object" && value.type === "snapshot";
